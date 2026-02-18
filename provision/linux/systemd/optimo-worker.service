@@ -1,0 +1,19 @@
+[Unit]
+Description=Bravo OPTIMO Worker (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=optimo
+Group=optimo
+WorkingDirectory=/opt/optimo/BravoOPTIMO_UI/backend
+EnvironmentFile=/etc/optimo-worker.env
+ExecStartPre=/usr/local/bin/optimo-worker-update.sh
+ExecStart=/opt/optimo/BravoOPTIMO_UI/.venv/bin/uvicorn worker.main:app --host 0.0.0.0 --port 1112
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+

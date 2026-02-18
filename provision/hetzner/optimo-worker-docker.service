@@ -1,0 +1,23 @@
+[Unit]
+Description=Bravo OPTIMO Worker (Docker)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/optimo-worker-docker.env
+ExecStartPre=/usr/bin/mkdir -p ${OPTIMO_WORKER_ROOT}
+ExecStartPre=/usr/bin/docker pull ${OPTIMO_WORKER_IMAGE}
+ExecStart=/usr/bin/docker run --name optimo-worker --restart=always \
+  -p ${OPTIMO_WORKER_PORT}:1112 \
+  -e OPTIMO_WORKER_ROOT=/data/worker_runs \
+  -e OPTIMO_WORKER_PARALLEL=${OPTIMO_WORKER_PARALLEL} \
+  -v ${OPTIMO_WORKER_ROOT}:/data/worker_runs \
+  ${OPTIMO_WORKER_IMAGE}
+ExecStop=/usr/bin/docker rm -f optimo-worker
+
+[Install]
+WantedBy=multi-user.target
+
