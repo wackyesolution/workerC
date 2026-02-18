@@ -4,15 +4,14 @@ WORKDIR /app
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONPATH=/app \
     OPTIMO_WORKER_ROOT=/data/worker_runs
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY worker /app/worker
+COPY main.py /app/main.py
+COPY __init__.py /app/__init__.py
 
 EXPOSE 1112
 
-CMD ["uvicorn", "worker.main:app", "--host", "0.0.0.0", "--port", "1112"]
-
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "1112"]

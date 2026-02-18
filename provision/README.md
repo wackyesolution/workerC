@@ -1,10 +1,10 @@
-# Worker provisioning (no Docker)
+# Worker provisioning
 
-This repo includes a **FastAPI worker** at `backend/worker/main.py` that OptimoUI can use as a remote “agent”.
+This repo includes a **FastAPI worker** at `main.py` that OptimoUI can use as a remote “agent”.
 
 ## Important: where does cTrader run?
 
-The worker ultimately shells out to the cTrader CLI (`CTRADE_CLI_PATH`).
+The worker ultimately shells out to the cTrader CLI (`CTRADE_CLI_PATH`) via `subprocess`.
 
 If your cTrader CLI is **macOS-only** (`cTrader.Mac`) or **Windows-only**, then:
 
@@ -17,20 +17,20 @@ In that case you can run the worker itself as a container based on the cTrader C
 ## Docker (Linux) worker with cTrader CLI inside
 
 Files:
-- `backend/worker/Dockerfile.ctrader`
-- `docker-compose.worker-ctrader.yml`
+- `Dockerfile.ctrader`
 
 Local run:
-- `docker compose -f docker-compose.worker-ctrader.yml up --build`
-- `curl http://localhost:1112/status`
+- `docker build -f Dockerfile.ctrader -t workerc-ctrader:latest .`
+- `docker run --rm -p 1112:1112 -e OPTIMO_WORKER_PARALLEL=4 -v /var/lib/optimo-worker/runs:/data/worker_runs workerc-ctrader:latest`
+- `curl http://127.0.0.1:1112/status`
 
 ## Ubuntu (systemd) setup
 
 Files:
-- `backend/worker/provision/linux/install_ubuntu.sh`
-- `backend/worker/provision/linux/systemd/optimo-worker.service`
-- `backend/worker/provision/linux/optimo-worker.env.example`
-- `backend/worker/provision/linux/optimo-worker-update.sh`
+- `provision/linux/install_ubuntu.sh`
+- `provision/linux/systemd/optimo-worker.service`
+- `provision/linux/optimo-worker.env.example`
+- `provision/linux/optimo-worker-update.sh`
 
 What you get:
 - `optimo-worker` systemd service on port `1112`
@@ -56,6 +56,6 @@ If you use the Spotware Linux cTrader CLI Docker image, the simplest Hetzner set
 6. Create new worker VMs from the snapshot whenever you need capacity.
 
 Provisioning templates:
-- `backend/worker/provision/hetzner/README.md`
-- `backend/worker/provision/hetzner/optimo-worker-docker.service`
-- `backend/worker/provision/hetzner/optimo-worker-docker.env.example`
+- `provision/hetzner/README.md`
+- `provision/hetzner/optimo-worker-docker.service`
+- `provision/hetzner/optimo-worker-docker.env.example`

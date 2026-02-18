@@ -30,9 +30,8 @@ touch "$LOG"
   git reset --hard "$REMOTE/$BRANCH"
 
   if [[ -x "$REPO_DIR/.venv/bin/python" ]]; then
-    "$REPO_DIR/.venv/bin/pip" install --no-cache-dir -r "$REPO_DIR/backend/requirements.txt"
+    "$REPO_DIR/.venv/bin/pip" install --no-cache-dir -r "$REPO_DIR/requirements.txt"
   else
     echo "[update] venv missing; skipping pip"
   fi
 } >>"$LOG" 2>&1
-
