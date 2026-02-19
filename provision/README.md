@@ -73,3 +73,10 @@ Provisioning templates:
 - `provision/hetzner/README.md`
 - `provision/hetzner/optimo-worker-docker.service`
 - `provision/hetzner/optimo-worker-docker.env.example`
+
+One-shot install (Hetzner/Ubuntu):
+```bash
+curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/provision/hetzner/install.sh | sudo bash -s -- \
+  --image ghcr.io/<owner>/<image>:latest \
+  --parallel auto
+```

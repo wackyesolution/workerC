@@ -27,6 +27,11 @@ OPTIMO_WORKER_CONTAINER_NAME="${OPTIMO_WORKER_CONTAINER_NAME:-optimo-worker}"
 OPTIMO_WORKER_PORT="${OPTIMO_WORKER_PORT:-1112}"
 OPTIMO_WORKER_ROOT="${OPTIMO_WORKER_ROOT:-/var/lib/optimo-worker/runs}"
 OPTIMO_WORKER_PARALLEL="${OPTIMO_WORKER_PARALLEL:-auto}"
+CTRADE_CLI_PATH="${CTRADE_CLI_PATH:-ctrader-cli}"
+
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+CHAT_ID="${CHAT_ID:-${CHAT_DANIEL:-}}"
+OPTIMO_WORKER_PUBLIC_URL="${OPTIMO_WORKER_PUBLIC_URL:-}"
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -74,11 +79,24 @@ echo "[bootstrap] desired image id: $desired_image_id"
 run_container() {
   echo "[bootstrap] (re)creating container $OPTIMO_WORKER_CONTAINER_NAME"
   docker rm -f "$OPTIMO_WORKER_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+  tg_args=()
+  if [[ -n "$TELEGRAM_BOT_TOKEN" ]]; then
+    tg_args+=( -e "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN" )
+  fi
+  if [[ -n "$CHAT_ID" ]]; then
+    tg_args+=( -e "CHAT_ID=$CHAT_ID" )
+  fi
+  if [[ -n "$OPTIMO_WORKER_PUBLIC_URL" ]]; then
+    tg_args+=( -e "OPTIMO_WORKER_PUBLIC_URL=$OPTIMO_WORKER_PUBLIC_URL" )
+  fi
+
   docker run -d --name "$OPTIMO_WORKER_CONTAINER_NAME" --restart=always \
     -p "${OPTIMO_WORKER_PORT}:1112" \
     -e OPTIMO_WORKER_PARALLEL="$OPTIMO_WORKER_PARALLEL" \
     -e OPTIMO_WORKER_ROOT=/data/worker_runs \
-    -e CTRADE_CLI_PATH=ctrader-cli \
+    -e CTRADE_CLI_PATH="$CTRADE_CLI_PATH" \
+    "${tg_args[@]}" \
     -v "${OPTIMO_WORKER_ROOT}:/data/worker_runs" \
     "$OPTIMO_WORKER_IMAGE"
 }

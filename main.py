@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, Optional
+from urllib.parse import urlencode
 from urllib import request as urlrequest
 from urllib import error as urlerror
 
@@ -143,6 +144,26 @@ def post_json(url: str, payload: dict[str, Any], timeout: int = 10) -> tuple[boo
         return False, f"HTTP {exc.code}: {detail}"
     except Exception as exc:
         return False, str(exc)
+
+
+def _detect_public_ip(timeout: int = 5) -> str | None:
+    for u in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            with urlrequest.urlopen(u, timeout=timeout) as resp:
+                ip = resp.read().decode("utf-8", errors="ignore").strip()
+            if ip:
+                return ip
+        except Exception:
+            continue
+    return None
+
+
+def _telegram_send_message(token: str, chat_id: str, text: str, timeout: int = 10) -> None:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
+    req = urlrequest.Request(url, data=data, method="POST")
+    with urlrequest.urlopen(req, timeout=timeout) as resp:
+        _ = resp.read()
 
 
 def run_backtest(
@@ -311,6 +332,46 @@ STATE_LOCK = threading.Lock()
 CURRENT_RUN: _RunState | None = None
 
 app = FastAPI(title="Bravo OPTIMO Worker", version="0.1.0")
+
+
+@app.on_event("startup")
+async def _announce_online_startup() -> None:
+    token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    if not token:
+        return
+
+    notify = (os.environ.get("OPTIMO_WORKER_TELEGRAM_NOTIFY") or "1").strip().lower()
+    if notify in ("0", "false", "no", "off"):
+        return
+
+    chat_id = (os.environ.get("CHAT_ID") or os.environ.get("CHAT_DANIEL") or "").strip()
+    if not chat_id:
+        return
+
+    await asyncio.sleep(0.5)
+
+    public_url = (os.environ.get("OPTIMO_WORKER_PUBLIC_URL") or "").strip()
+    if not public_url:
+        ip = (os.environ.get("OPTIMO_WORKER_PUBLIC_IP") or "").strip() or _detect_public_ip()
+        port = (
+            (os.environ.get("OPTIMO_WORKER_PUBLIC_PORT") or "").strip()
+            or (os.environ.get("OPTIMO_WORKER_PORT") or "").strip()
+            or "1112"
+        )
+        if ip:
+            public_url = f"http://{ip}:{port}"
+
+    msg = "\n".join(
+        [
+            "Sono online!",
+            public_url or "(public url unknown)",
+            f"max_parallel={MAX_PARALLEL} cpu_cores={_auto_parallel_default()}",
+        ]
+    )
+    try:
+        await asyncio.to_thread(_telegram_send_message, token, chat_id, msg, 10)
+    except Exception as exc:
+        print(f"[telegram] notify failed: {exc}")
 
 
 def _get_run_or_404(run_id: str) -> _RunState:
