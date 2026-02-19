@@ -8,28 +8,21 @@ This avoids installing cTrader “natively” on the host.
 
 1) Create an Ubuntu VM on Hetzner (e.g. Ubuntu 24.04), attach your SSH key, allow inbound TCP `1112` (or restrict it to OptimoUI’s IP).
 
-2) Install Docker:
+2) Install with one command (Docker + autostart + pull on reboot):
 ```bash
-curl -fsSL https://get.docker.com | sh
+curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/provision/hetzner/install.sh | sudo bash -s -- \
+  --image ghcr.io/wackyesolution/workerc-ctrader:latest \
+  --parallel auto
 ```
 
-3) Login to GHCR (private image pull):
-```bash
-docker login ghcr.io
-```
+If the image is private, run `docker login ghcr.io` first (or pass `--ghcr-user/--ghcr-token`).
 
-4) Copy templates onto the VM and configure:
-- `/etc/optimo-worker-docker.env` (based on `optimo-worker-docker.env.example`)
-- `/etc/systemd/system/optimo-worker-docker.service` (based on `optimo-worker-docker.service`)
-
-5) Enable/start:
+3) Verify:
 ```bash
-systemctl daemon-reload
-systemctl enable --now optimo-worker-docker
 curl http://127.0.0.1:1112/status
 ```
 
-6) Take a Hetzner **snapshot** from this VM.
+4) Take a Hetzner **snapshot** from this VM.
 
 ## Using the snapshot
 
@@ -43,4 +36,3 @@ In OptimoUI → Worker Farm, add:
 - `http://<WORKER_PUBLIC_IP>:1112`
 
 Reminder: OptimoUI is configured to **refuse starting** distributed GA unless **all workers respond and are idle**.
-

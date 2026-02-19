@@ -1,6 +1,94 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+install.sh (Hetzner/Ubuntu) - installs Docker + systemd autostart for Optimo worker container.
+
+Required:
+  --image <ghcr.io/...:tag>
+
+Optional:
+  --port <1112>
+  --root <host_path_for_runs>
+  --parallel <auto|N>
+  --container-name <optimo-worker>
+  --ghcr-user <user>      If provided together with --ghcr-token, runs `docker login ghcr.io`.
+  --ghcr-token <token>
+
+Example:
+  sudo bash install.sh --image ghcr.io/wackyesolution/workerc-ctrader:latest --parallel auto
+EOF
+}
+
+IMAGE=""
+PORT="1112"
+ROOT="/var/lib/optimo-worker/runs"
+PARALLEL="auto"
+CONTAINER_NAME="optimo-worker"
+CTRADE_CLI_PATH="ctrader-cli"
+GHCR_USER="${GHCR_USERNAME:-}"
+GHCR_TOKEN="${GHCR_TOKEN:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --image) IMAGE="${2:-}"; shift 2;;
+    --port) PORT="${2:-}"; shift 2;;
+    --root) ROOT="${2:-}"; shift 2;;
+    --parallel) PARALLEL="${2:-}"; shift 2;;
+    --container-name) CONTAINER_NAME="${2:-}"; shift 2;;
+    --ctrade-cli-path) CTRADE_CLI_PATH="${2:-}"; shift 2;;
+    --ghcr-user) GHCR_USER="${2:-}"; shift 2;;
+    --ghcr-token) GHCR_TOKEN="${2:-}"; shift 2;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 2;;
+  esac
+done
+
+if [[ -z "$IMAGE" ]]; then
+  echo "Missing --image" >&2
+  usage
+  exit 2
+fi
+
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "Run as root (use sudo)." >&2
+  exit 1
+fi
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates curl python3
+
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+  sh /tmp/get-docker.sh
+fi
+
+systemctl enable --now docker
+
+if [[ -n "$GHCR_USER" && -n "$GHCR_TOKEN" ]]; then
+  echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+else
+  echo "[note] Skipping GHCR login. If your image is private, run: docker login ghcr.io" >&2
+fi
+
+mkdir -p "$ROOT"
+
+cat >/etc/optimo-worker-docker.env <<EOF
+OPTIMO_WORKER_IMAGE=$IMAGE
+OPTIMO_WORKER_CONTAINER_NAME=$CONTAINER_NAME
+OPTIMO_WORKER_PORT=$PORT
+OPTIMO_WORKER_ROOT=$ROOT
+OPTIMO_WORKER_PARALLEL=$PARALLEL
+CTRADE_CLI_PATH=$CTRADE_CLI_PATH
+EOF
+
+cat >/usr/local/bin/optimo-worker-docker-bootstrap.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
 LOG="${OPTIMO_WORKER_BOOTSTRAP_LOG:-/var/log/optimo-worker-bootstrap.log}"
 ENV_FILE="${OPTIMO_WORKER_DOCKER_ENV_FILE:-/etc/optimo-worker-docker.env}"
 
@@ -27,6 +115,7 @@ OPTIMO_WORKER_CONTAINER_NAME="${OPTIMO_WORKER_CONTAINER_NAME:-optimo-worker}"
 OPTIMO_WORKER_PORT="${OPTIMO_WORKER_PORT:-1112}"
 OPTIMO_WORKER_ROOT="${OPTIMO_WORKER_ROOT:-/var/lib/optimo-worker/runs}"
 OPTIMO_WORKER_PARALLEL="${OPTIMO_WORKER_PARALLEL:-auto}"
+CTRADE_CLI_PATH="${CTRADE_CLI_PATH:-ctrader-cli}"
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -78,7 +167,7 @@ run_container() {
     -p "${OPTIMO_WORKER_PORT}:1112" \
     -e OPTIMO_WORKER_PARALLEL="$OPTIMO_WORKER_PARALLEL" \
     -e OPTIMO_WORKER_ROOT=/data/worker_runs \
-    -e CTRADE_CLI_PATH=ctrader-cli \
+    -e CTRADE_CLI_PATH="$CTRADE_CLI_PATH" \
     -v "${OPTIMO_WORKER_ROOT}:/data/worker_runs" \
     "$OPTIMO_WORKER_IMAGE"
 }
@@ -107,3 +196,30 @@ if [[ "$running" != "true" ]]; then
 fi
 
 echo "[bootstrap] $(ts) done (no change)"
+EOF
+
+chmod +x /usr/local/bin/optimo-worker-docker-bootstrap.sh
+
+cat >/etc/systemd/system/optimo-worker-docker-bootstrap.service <<'EOF'
+[Unit]
+Description=Optimo Worker (Docker bootstrap/update)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/optimo-worker-docker.env
+ExecStart=/usr/local/bin/optimo-worker-docker-bootstrap.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now optimo-worker-docker-bootstrap.service
+
+echo "OK"
+echo "  Worker status: http://127.0.0.1:${PORT}/status"
+echo "  Logs:          tail -n 200 /var/log/optimo-worker-bootstrap.log"

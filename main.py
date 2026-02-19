@@ -29,8 +29,27 @@ CTRADE_BIN = os.environ.get(
 WORKER_ROOT = Path(os.environ.get("OPTIMO_WORKER_ROOT", "./data/worker_runs")).expanduser().resolve()
 WORKER_ROOT.mkdir(parents=True, exist_ok=True)
 
-MAX_PARALLEL = int(os.environ.get("OPTIMO_WORKER_PARALLEL", str(os.cpu_count() or 1)))
-MAX_PARALLEL = max(1, MAX_PARALLEL)
+def _auto_parallel_default() -> int:
+    try:
+        return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+    except Exception:
+        return int(os.cpu_count() or 1)
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if not raw or raw.lower() == "auto":
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+MAX_PARALLEL = max(1, _int_env("OPTIMO_WORKER_PARALLEL", _auto_parallel_default()))
 
 
 def now_utc_iso() -> str:
@@ -424,7 +443,7 @@ def status():
         queued=queued,
         running=running,
         max_parallel=MAX_PARALLEL,
-        cpu_cores=int(os.cpu_count() or 1),
+        cpu_cores=_auto_parallel_default(),
         current_run_id=run.run_id if run else None,
         started_at_utc=APP_STARTED_AT,
     )
