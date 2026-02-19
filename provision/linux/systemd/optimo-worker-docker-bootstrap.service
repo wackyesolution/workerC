@@ -1,0 +1,13 @@
+[Unit]
+Description=Optimo Worker (Docker bootstrap/update)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/optimo-worker-docker.env
+ExecStart=/usr/local/bin/optimo-worker-docker-bootstrap.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

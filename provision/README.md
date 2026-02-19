@@ -24,6 +24,20 @@ Local run:
 - `docker run --rm -p 1112:1112 -e OPTIMO_WORKER_PARALLEL=4 -v /var/lib/optimo-worker/runs:/data/worker_runs workerc-ctrader:latest`
 - `curl http://127.0.0.1:1112/status`
 
+## Ubuntu: auto-install Docker + auto-update image on every reboot
+
+Files:
+- `provision/linux/optimo-worker-docker-bootstrap.sh`
+- `provision/linux/systemd/optimo-worker-docker-bootstrap.service`
+- `provision/linux/optimo-worker-docker.env.example`
+
+Typical install on the server:
+- `sudo install -m 0755 provision/linux/optimo-worker-docker-bootstrap.sh /usr/local/bin/optimo-worker-docker-bootstrap.sh`
+- `sudo install -m 0644 provision/linux/optimo-worker-docker.env.example /etc/optimo-worker-docker.env`
+- `sudo install -m 0644 provision/linux/systemd/optimo-worker-docker-bootstrap.service /etc/systemd/system/optimo-worker-docker-bootstrap.service`
+- `sudo systemctl daemon-reload`
+- `sudo systemctl enable --now optimo-worker-docker-bootstrap`
+
 ## Ubuntu (systemd) setup
 
 Files:

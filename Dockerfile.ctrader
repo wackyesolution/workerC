@@ -19,4 +19,7 @@ COPY __init__.py /app/__init__.py
 
 EXPOSE 1112
 
-CMD ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "1112"]
+# Base image sets an ENTRYPOINT to ctrader-cli (dotnet). Override it so this
+# container starts the FastAPI worker instead.
+ENTRYPOINT ["python3", "-m", "uvicorn"]
+CMD ["main:app", "--host", "0.0.0.0", "--port", "1112"]
