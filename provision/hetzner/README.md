@@ -18,7 +18,9 @@ curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/provision/hetzn
 If the image is private, run `docker login ghcr.io` first (or pass `--ghcr-user/--ghcr-token`).
 
 Optional: Telegram “online” message (be aware tokens can end up in shell history; prefer setting env in `/etc/optimo-worker-docker.env`):
-- `--telegram-token ... --chat-id ... --public-url http://<IP>:1112`
+- via args: `--telegram-token ... --chat-id ... --public-url http://<IP>:1112`
+- or via env (works great with `curl | bash`):
+  - `sudo TELEGRAM_BOT_TOKEN=... CHAT_ID=... OPTIMO_WORKER_PUBLIC_URL=http://<IP>:1112 bash -s -- ...`
 
 3) Verify:
 ```bash

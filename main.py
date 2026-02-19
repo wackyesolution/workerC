@@ -368,10 +368,14 @@ async def _announce_online_startup() -> None:
             f"max_parallel={MAX_PARALLEL} cpu_cores={_auto_parallel_default()}",
         ]
     )
-    try:
-        await asyncio.to_thread(_telegram_send_message, token, chat_id, msg, 10)
-    except Exception as exc:
-        print(f"[telegram] notify failed: {exc}")
+    for attempt in range(1, 6):
+        try:
+            await asyncio.to_thread(_telegram_send_message, token, chat_id, msg, 10)
+            print("[telegram] online notify sent")
+            return
+        except Exception as exc:
+            print(f"[telegram] notify failed (attempt {attempt}/5): {exc}")
+            await asyncio.sleep(min(5.0, attempt))
 
 
 def _get_run_or_404(run_id: str) -> _RunState:
