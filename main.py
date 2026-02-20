@@ -11,6 +11,7 @@ import threading
 import time
 import uuid
 import zipfile
+import shlex
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -184,8 +185,9 @@ def run_backtest(
     timeout_seconds: int,
     balance: float | None,
 ) -> bool:
+    cmd_prefix = _resolve_ctrade_cmd_prefix()
     cmd = [
-        CTRADE_BIN,
+        *cmd_prefix,
         "backtest",
         str(algo_path),
         str(cbotset_path),
@@ -229,6 +231,35 @@ def run_backtest(
             time.sleep(1)
 
     return reports_ready()
+
+
+def _resolve_ctrade_cmd_prefix() -> list[str]:
+    raw = str(CTRADE_BIN or "").strip() or "ctrader-cli"
+    try:
+        parts = shlex.split(raw)
+    except Exception:
+        parts = [raw]
+    if not parts:
+        parts = ["ctrader-cli"]
+
+    exe = str(parts[0]).strip()
+    if exe:
+        if Path(exe).expanduser().exists():
+            return parts
+        if shutil.which(exe):
+            return parts
+
+    dll_candidates = [
+        Path("/app/ctrader-cli.dll"),
+        Path("/opt/worker/ctrader-cli.dll"),
+        Path("/opt/workerC/ctrader-cli.dll"),
+    ]
+    dotnet = shutil.which("dotnet")
+    for dll in dll_candidates:
+        if dotnet and dll.exists():
+            return [dotnet, str(dll)]
+
+    return parts
 
 
 class WorkerStatus(BaseModel):
@@ -562,7 +593,6 @@ def _execute_pass_job(run: _RunState, job: PassJob, worker_index: int) -> PassRe
 
     write_events(events_path)
     write_cbotset(cbotset_path, job.parameters, run.config.symbol, run.config.period)
-
     ok = run_backtest(
         algo_path=run.algo_path,
         cbotset_path=cbotset_path,
