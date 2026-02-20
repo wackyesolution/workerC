@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import deque
 import json
 import os
 import shutil
@@ -18,7 +19,7 @@ from urllib.parse import urlencode
 from urllib import request as urlrequest
 from urllib import error as urlerror
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
@@ -330,12 +331,93 @@ class _RunState:
 APP_STARTED_AT = now_utc_iso()
 STATE_LOCK = threading.Lock()
 CURRENT_RUN: _RunState | None = None
+LOG_LOCK = threading.Lock()
+LOG_SEQ = 0
+LOG_BUFFER: deque[dict[str, Any]] = deque(maxlen=max(500, _int_env("OPTIMO_WORKER_LOG_MAX_LINES", 2000)))
 
 app = FastAPI(title="Bravo OPTIMO Worker", version="0.1.0")
 
 
+def _log_event(
+    level: str,
+    message: str,
+    *,
+    kind: str = "app",
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    global LOG_SEQ
+    entry = {
+        "id": 0,
+        "ts": now_utc_iso(),
+        "level": str(level or "INFO").upper(),
+        "kind": str(kind or "app"),
+        "message": str(message or ""),
+    }
+    if isinstance(extra, dict) and extra:
+        entry["extra"] = extra
+    with LOG_LOCK:
+        LOG_SEQ += 1
+        entry["id"] = LOG_SEQ
+        LOG_BUFFER.append(entry)
+    return entry
+
+
+def _guess_bind_info() -> tuple[str, int]:
+    host = str(os.environ.get("OPTIMO_WORKER_HOST") or os.environ.get("HOST") or "0.0.0.0").strip() or "0.0.0.0"
+    raw_port = str(
+        os.environ.get("OPTIMO_WORKER_PORT")
+        or os.environ.get("PORT")
+        or os.environ.get("UVICORN_PORT")
+        or "1112"
+    ).strip()
+    try:
+        port = int(raw_port)
+    except Exception:
+        port = 1112
+    return host, port
+
+
+@app.middleware("http")
+async def _request_access_log(request: Request, call_next):
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        if request.url.path != "/logs/live":
+            _log_event(
+                "ERROR",
+                f"{request.method} {request.url.path} -> 500 ({elapsed_ms}ms) error={exc}",
+                kind="access",
+                extra={"method": request.method, "path": request.url.path, "elapsed_ms": elapsed_ms},
+            )
+        raise
+    elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
+    if request.url.path != "/logs/live":
+        _log_event(
+            "INFO",
+            f"{request.method} {request.url.path} -> {response.status_code} ({elapsed_ms}ms)",
+            kind="access",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "elapsed_ms": elapsed_ms,
+            },
+        )
+    return response
+
+
 @app.on_event("startup")
 async def _announce_online_startup() -> None:
+    host, port = _guess_bind_info()
+    _log_event(
+        "INFO",
+        f"Worker server running at {host}:{port} (max_parallel={MAX_PARALLEL})",
+        kind="startup",
+        extra={"host": host, "port": port, "max_parallel": MAX_PARALLEL},
+    )
+
     token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
     if not token:
         return
@@ -408,6 +490,12 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
             run.in_flight += 1
 
         started_at = now_utc_iso()
+        _log_event(
+            "INFO",
+            f"pass {job.pass_id} started (run_id={run.run_id}, worker_slot={worker_index})",
+            kind="run",
+            extra={"run_id": run.run_id, "pass_id": job.pass_id, "worker_slot": worker_index, "phase": "started"},
+        )
         try:
             result = await asyncio.to_thread(_execute_pass_job, run, job, worker_index)
             result.started_at_utc = started_at
@@ -427,6 +515,13 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
             run.results.append(result)
             run.in_flight -= 1
 
+        _log_event(
+            "INFO" if result.status == "Completed" else "ERROR",
+            f"pass {job.pass_id} finished status={result.status} (run_id={run.run_id})",
+            kind="run",
+            extra={"run_id": run.run_id, "pass_id": job.pass_id, "status": result.status, "phase": "finished"},
+        )
+
         run.queue.task_done()
 
         if run.config.callback_url:
@@ -434,6 +529,12 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
             ok, err = await asyncio.to_thread(post_json, run.config.callback_url, payload, 10)
             if not ok:
                 # keep the run going; record the callback error as best-effort
+                _log_event(
+                    "ERROR",
+                    f"callback failed for pass {job.pass_id}: {err}",
+                    kind="run",
+                    extra={"run_id": run.run_id, "pass_id": job.pass_id, "phase": "callback", "error": err},
+                )
                 with STATE_LOCK:
                     run.results.append(
                         PassResult(
@@ -514,6 +615,31 @@ def status():
     )
 
 
+@app.get("/logs/live")
+def logs_live(since_id: int = 0, limit: int = 200):
+    since = max(0, int(since_id or 0))
+    lim = max(1, min(int(limit or 200), 2000))
+    with LOG_LOCK:
+        snapshot = list(LOG_BUFFER)
+        latest_id = LOG_SEQ
+    if not snapshot:
+        return {"items": [], "next_since_id": since, "dropped": False, "latest_id": latest_id}
+
+    oldest_id = int(snapshot[0].get("id") or 0)
+    dropped = since > 0 and oldest_id > (since + 1)
+    items = [entry for entry in snapshot if int(entry.get("id") or 0) > since]
+    if len(items) > lim:
+        items = items[-lim:]
+        dropped = True
+    next_since_id = int(items[-1].get("id") or since) if items else since
+    return {
+        "items": items,
+        "next_since_id": next_since_id,
+        "dropped": dropped,
+        "latest_id": latest_id,
+    }
+
+
 @app.post("/run/start", response_model=RunStartResponse)
 async def run_start(payload: RunStartRequest):
     global CURRENT_RUN
@@ -576,6 +702,16 @@ async def run_start(payload: RunStartRequest):
     for i in range(MAX_PARALLEL):
         asyncio.create_task(_process_loop(run_state, i))
 
+    _log_event(
+        "INFO",
+        (
+            f"run started id={run_id} bot={payload.bot_name or '-'} ver={payload.bot_version or '-'} "
+            f"symbol={payload.symbol} period={payload.period}"
+        ),
+        kind="run",
+        extra={"run_id": run_id, "phase": "run_start", "symbol": payload.symbol, "period": payload.period},
+    )
+
     return RunStartResponse(run_id=run_id, max_parallel=MAX_PARALLEL, workdir=str(workdir))
 
 
@@ -594,6 +730,13 @@ async def run_assign(run_id: str, payload: AssignPassesRequest):
         run.enqueued_total += accepted
         queued = run.queue.qsize()
 
+    _log_event(
+        "INFO",
+        f"run {run_id} assigned {accepted} pass(es), queued={queued}",
+        kind="run",
+        extra={"run_id": run_id, "phase": "assign", "accepted": accepted, "queued": queued},
+    )
+
     return AssignPassesResponse(run_id=run_id, accepted=accepted, queued=queued)
 
 
@@ -611,4 +754,5 @@ def run_results(run_id: str, limit: int = 2000):
 async def run_stop(run_id: str):
     run = _get_run_or_404(run_id)
     run.stop.set()
+    _log_event("INFO", f"run {run_id} stop requested", kind="run", extra={"run_id": run_id, "phase": "stop"})
     return {"ok": True}
