@@ -14,10 +14,10 @@ ExecStart=/usr/bin/docker run --name optimo-worker --restart=always \
   -p ${OPTIMO_WORKER_PORT}:1112 \
   -e OPTIMO_WORKER_ROOT=/data/worker_runs \
   -e OPTIMO_WORKER_PARALLEL=${OPTIMO_WORKER_PARALLEL} \
+  -e OPTIMO_WORKER_PARALLEL_PER_CORE=${OPTIMO_WORKER_PARALLEL_PER_CORE} \
   -v ${OPTIMO_WORKER_ROOT}:/data/worker_runs \
   ${OPTIMO_WORKER_IMAGE}
 ExecStop=/usr/bin/docker rm -f optimo-worker
 
 [Install]
 WantedBy=multi-user.target
-

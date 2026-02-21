@@ -80,4 +80,5 @@ curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/provision/hetzn
   --image ghcr.io/<owner>/<image>:latest \
   --parallel auto
 ```
+With `--parallel auto`, effective worker slots = detected CPUs * `OPTIMO_WORKER_PARALLEL_PER_CORE` (default `2`).
 dd

@@ -52,7 +52,10 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
-MAX_PARALLEL = max(1, _int_env("OPTIMO_WORKER_PARALLEL", _auto_parallel_default()))
+AUTO_PARALLEL_BASE = max(1, _auto_parallel_default())
+# Run 2 jobs per CPU core by default (overridable).
+PARALLEL_PER_CORE = max(1, _int_env("OPTIMO_WORKER_PARALLEL_PER_CORE", 2))
+MAX_PARALLEL = max(1, _int_env("OPTIMO_WORKER_PARALLEL", AUTO_PARALLEL_BASE * PARALLEL_PER_CORE))
 
 
 def now_utc_iso() -> str:
@@ -722,30 +725,21 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
             _release_run_if_idle(run)
 
         if run.config.callback_url:
-            payload = result.model_dump()
-            ok, err = await asyncio.to_thread(post_json, run.config.callback_url, payload, 10)
-            if not ok:
-                # keep the run going; record the callback error as best-effort
-                _log_event(
-                    "ERROR",
-                    f"callback failed for pass {job.pass_id}: {err}",
-                    kind="run",
-                    extra={"run_id": run.run_id, "pass_id": job.pass_id, "phase": "callback", "error": err},
-                )
-                with STATE_LOCK:
-                    run.results.append(
-                        PassResult(
-                            run_id=run.run_id,
-                            pass_id=job.pass_id,
-                            status="Skipped",
-                            started_at_utc=now_utc_iso(),
-                            finished_at_utc=now_utc_iso(),
-                            metrics={},
-                            artifacts_zip_b64=None,
-                            error=f"callback_failed: {err}",
-                        )
-                    )
+            asyncio.create_task(_notify_callback(run, result))
     _release_run_if_idle(run)
+
+
+async def _notify_callback(run: _RunState, result: PassResult) -> None:
+    payload = result.model_dump()
+    ok, err = await asyncio.to_thread(post_json, run.config.callback_url or "", payload, 10)
+    if not ok:
+        # Keep run throughput high: callback is best-effort and never blocks worker slots.
+        _log_event(
+            "ERROR",
+            f"callback failed for pass {result.pass_id}: {err}",
+            kind="run",
+            extra={"run_id": run.run_id, "pass_id": result.pass_id, "phase": "callback", "error": err},
+        )
 
 
 def _execute_pass_job(run: _RunState, job: PassJob, worker_index: int) -> PassResult:
@@ -941,10 +935,15 @@ async def run_assign(run_id: str, payload: AssignPassesRequest):
 
 
 @app.get("/run/{run_id}/results", response_model=RunResultsResponse)
-def run_results(run_id: str, limit: int = 2000):
+def run_results(run_id: str, limit: int = 2000, include_artifacts: int = 1):
     run = _get_run_or_404(run_id)
+    with_artifacts = bool(int(include_artifacts or 0))
     with STATE_LOCK:
-        results = list(run.results)[-limit:]
+        snapshot = list(run.results)[-limit:]
+        if with_artifacts:
+            results = snapshot
+        else:
+            results = [r.model_copy(update={"artifacts_zip_b64": None}) for r in snapshot]
         completed = len(run.results)
         total = run.enqueued_total
     return RunResultsResponse(run_id=run_id, completed=completed, total_enqueued=total, results=results)
