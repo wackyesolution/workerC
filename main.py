@@ -15,7 +15,7 @@ import shlex
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 from urllib.parse import urlencode
 from urllib import request as urlrequest
 from urllib import error as urlerror
@@ -184,6 +184,9 @@ def run_backtest(
     log_path: Path,
     timeout_seconds: int,
     balance: float | None,
+    stop_requested: Optional[Callable[[], bool]] = None,
+    on_proc_start: Optional[Callable[[subprocess.Popen], None]] = None,
+    on_proc_end: Optional[Callable[[int], None]] = None,
 ) -> bool:
     cmd_prefix = _resolve_ctrade_cmd_prefix()
     cmd = [
@@ -218,17 +221,61 @@ def run_backtest(
         logf.write(f"[command] {' '.join(cmd)}\n\n")
         logf.flush()
         proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True)
+        if on_proc_start:
+            try:
+                on_proc_start(proc)
+            except Exception:
+                pass
 
-        start_ts = time.time()
-        while True:
-            if reports_ready():
-                return True
-            if proc.poll() is not None:
-                break
-            if timeout_seconds and (time.time() - start_ts) >= timeout_seconds:
-                # leave process running by policy; consider it failed for now
-                break
-            time.sleep(1)
+        try:
+            start_ts = time.time()
+            while True:
+                if stop_requested and stop_requested():
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=3)
+                    except Exception:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=1)
+                        except Exception:
+                            pass
+                    break
+                if reports_ready():
+                    if proc.poll() is None:
+                        try:
+                            proc.wait(timeout=2)
+                        except Exception:
+                            try:
+                                proc.terminate()
+                                proc.wait(timeout=2)
+                            except Exception:
+                                try:
+                                    proc.kill()
+                                    proc.wait(timeout=1)
+                                except Exception:
+                                    pass
+                    return True
+                if proc.poll() is not None:
+                    break
+                if timeout_seconds and (time.time() - start_ts) >= timeout_seconds:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=3)
+                    except Exception:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=1)
+                        except Exception:
+                            pass
+                    break
+                time.sleep(1)
+        finally:
+            if on_proc_end:
+                try:
+                    on_proc_end(int(proc.pid))
+                except Exception:
+                    pass
 
     return reports_ready()
 
@@ -353,10 +400,13 @@ class _RunState:
     in_flight: int = 0
     enqueued_total: int = 0
     results: list[PassResult] = None  # type: ignore[assignment]
+    active_procs: dict[int, subprocess.Popen] = None  # type: ignore[assignment]
 
     def __post_init__(self):
         if self.results is None:
             self.results = []
+        if self.active_procs is None:
+            self.active_procs = {}
 
 
 APP_STARTED_AT = now_utc_iso()
@@ -507,6 +557,93 @@ def _is_busy(run: _RunState | None) -> tuple[bool, int, int]:
     return (queued > 0 or running > 0), queued, running
 
 
+def _track_run_proc_start(run: _RunState, proc: subprocess.Popen) -> None:
+    pid = int(proc.pid or 0)
+    if pid <= 0:
+        return
+    with STATE_LOCK:
+        run.active_procs[pid] = proc
+
+
+def _track_run_proc_end(run: _RunState, pid: int) -> None:
+    with STATE_LOCK:
+        run.active_procs.pop(int(pid), None)
+
+
+def _drain_run_queue(run: _RunState) -> int:
+    dropped = 0
+    while True:
+        try:
+            _ = run.queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        try:
+            run.queue.task_done()
+        except Exception:
+            pass
+        dropped += 1
+    return dropped
+
+
+def _terminate_active_processes(run: _RunState) -> int:
+    with STATE_LOCK:
+        procs = list(run.active_procs.values())
+    killed = 0
+    for proc in procs:
+        try:
+            if proc.poll() is not None:
+                continue
+            try:
+                proc.terminate()
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+            if proc.poll() is not None:
+                killed += 1
+        except Exception:
+            continue
+    return killed
+
+
+def _release_run_if_idle(run: _RunState) -> bool:
+    global CURRENT_RUN
+    with STATE_LOCK:
+        queued = run.queue.qsize()
+        running = run.in_flight
+        if CURRENT_RUN is run and run.stop.is_set() and queued <= 0 and running <= 0:
+            CURRENT_RUN = None
+            return True
+    return False
+
+
+def _stop_and_unlock_run(run: _RunState, reason: str) -> dict[str, Any]:
+    run.stop.set()
+    dropped = _drain_run_queue(run)
+    killed = _terminate_active_processes(run)
+    released = _release_run_if_idle(run)
+    _log_event(
+        "WARNING",
+        (
+            f"run {run.run_id} stop/unlock reason={reason} "
+            f"dropped={dropped} killed={killed} released={released}"
+        ),
+        kind="run",
+        extra={
+            "run_id": run.run_id,
+            "phase": "unlock",
+            "reason": reason,
+            "dropped": dropped,
+            "killed": killed,
+            "released": released,
+        },
+    )
+    return {"dropped_queued": dropped, "killed_processes": killed, "released": released}
+
+
 async def _process_loop(run: _RunState, worker_index: int) -> None:
     while not run.stop.is_set():
         try:
@@ -554,6 +691,8 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
         )
 
         run.queue.task_done()
+        if run.stop.is_set():
+            _release_run_if_idle(run)
 
         if run.config.callback_url:
             payload = result.model_dump()
@@ -579,6 +718,7 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
                             error=f"callback_failed: {err}",
                         )
                     )
+    _release_run_if_idle(run)
 
 
 def _execute_pass_job(run: _RunState, job: PassJob, worker_index: int) -> PassResult:
@@ -609,6 +749,9 @@ def _execute_pass_job(run: _RunState, job: PassJob, worker_index: int) -> PassRe
         log_path=log_path,
         timeout_seconds=int(run.config.timeout_seconds),
         balance=run.config.balance,
+        stop_requested=run.stop.is_set,
+        on_proc_start=lambda proc: _track_run_proc_start(run, proc),
+        on_proc_end=lambda pid: _track_run_proc_end(run, pid),
     )
     rep = parse_report(report_json) if ok else None
     metrics = rep or {}
@@ -783,6 +926,22 @@ def run_results(run_id: str, limit: int = 2000):
 @app.post("/run/{run_id}/stop")
 async def run_stop(run_id: str):
     run = _get_run_or_404(run_id)
-    run.stop.set()
-    _log_event("INFO", f"run {run_id} stop requested", kind="run", extra={"run_id": run_id, "phase": "stop"})
-    return {"ok": True}
+    summary = _stop_and_unlock_run(run, reason="run_stop")
+    return {"ok": True, "run_id": run_id, **summary}
+
+
+@app.post("/run/{run_id}/unlock")
+async def run_unlock(run_id: str):
+    run = _get_run_or_404(run_id)
+    summary = _stop_and_unlock_run(run, reason="run_unlock")
+    return {"ok": True, "run_id": run_id, **summary}
+
+
+@app.post("/unlock")
+async def unlock_current_run():
+    with STATE_LOCK:
+        run = CURRENT_RUN
+    if not run:
+        return {"ok": True, "released": True, "message": "no_active_run"}
+    summary = _stop_and_unlock_run(run, reason="unlock_current")
+    return {"ok": True, "run_id": run.run_id, **summary}
