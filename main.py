@@ -227,8 +227,10 @@ def run_backtest(
             except Exception:
                 pass
 
+        start_ts = time.time()
+        success = False
+        outcome = "unknown"
         try:
-            start_ts = time.time()
             while True:
                 if stop_requested and stop_requested():
                     try:
@@ -240,6 +242,7 @@ def run_backtest(
                             proc.wait(timeout=1)
                         except Exception:
                             pass
+                    outcome = "stopped_by_request"
                     break
                 if reports_ready():
                     if proc.poll() is None:
@@ -255,8 +258,11 @@ def run_backtest(
                                     proc.wait(timeout=1)
                                 except Exception:
                                     pass
-                    return True
+                    success = True
+                    outcome = "reports_ready"
+                    break
                 if proc.poll() is not None:
+                    outcome = f"process_exited_rc_{proc.returncode}"
                     break
                 if timeout_seconds and (time.time() - start_ts) >= timeout_seconds:
                     try:
@@ -268,6 +274,7 @@ def run_backtest(
                             proc.wait(timeout=1)
                         except Exception:
                             pass
+                    outcome = "timeout"
                     break
                 time.sleep(1)
         finally:
@@ -276,8 +283,13 @@ def run_backtest(
                     on_proc_end(int(proc.pid))
                 except Exception:
                     pass
+            elapsed_total = round(max(0.0, time.time() - start_ts), 3)
+            logf.write(f"\n[finished_at_utc] {now_utc_iso()}\n")
+            logf.write(f"[elapsed_seconds_total] {elapsed_total}\n")
+            logf.write(f"[outcome] {outcome}\n")
+            logf.flush()
 
-    return reports_ready()
+    return success or reports_ready()
 
 
 def _resolve_ctrade_cmd_prefix() -> list[str]:
@@ -375,6 +387,7 @@ class PassResult(BaseModel):
     status: Literal["Completed", "Failed", "Skipped"]
     started_at_utc: str
     finished_at_utc: str
+    elapsed_seconds_total: Optional[float] = None
     metrics: dict[str, Any] = Field(default_factory=dict)
     artifacts_zip_b64: Optional[str] = None
     error: Optional[str] = None
@@ -658,6 +671,7 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
             run.in_flight += 1
 
         started_at = now_utc_iso()
+        started_perf = time.perf_counter()
         _log_event(
             "INFO",
             f"pass {job.pass_id} started (run_id={run.run_id}, worker_slot={worker_index})",
@@ -666,7 +680,6 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
         )
         try:
             result = await asyncio.to_thread(_execute_pass_job, run, job, worker_index)
-            result.started_at_utc = started_at
         except Exception as exc:
             result = PassResult(
                 run_id=run.run_id,
@@ -674,10 +687,15 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
                 status="Failed",
                 started_at_utc=started_at,
                 finished_at_utc=now_utc_iso(),
+                elapsed_seconds_total=None,
                 metrics={},
                 artifacts_zip_b64=None,
                 error=str(exc),
             )
+        elapsed_total = round(max(0.0, time.perf_counter() - started_perf), 3)
+        result.started_at_utc = started_at
+        result.finished_at_utc = now_utc_iso()
+        result.elapsed_seconds_total = elapsed_total
 
         with STATE_LOCK:
             run.results.append(result)
@@ -685,9 +703,18 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
 
         _log_event(
             "INFO" if result.status == "Completed" else "ERROR",
-            f"pass {job.pass_id} finished status={result.status} (run_id={run.run_id})",
+            (
+                f"pass {job.pass_id} finished status={result.status} "
+                f"elapsed_total_seconds={elapsed_total} (run_id={run.run_id})"
+            ),
             kind="run",
-            extra={"run_id": run.run_id, "pass_id": job.pass_id, "status": result.status, "phase": "finished"},
+            extra={
+                "run_id": run.run_id,
+                "pass_id": job.pass_id,
+                "status": result.status,
+                "phase": "finished",
+                "elapsed_seconds_total": elapsed_total,
+            },
         )
 
         run.queue.task_done()
