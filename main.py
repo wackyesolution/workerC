@@ -39,6 +39,13 @@ def _auto_parallel_default() -> int:
         return int(os.cpu_count() or 1)
 
 
+def _ctrader_like_parallel_default(cpu_cores: int) -> int:
+    # Align auto-parallelism with cTrader's default allocated cores:
+    # floor(cpu/2) + 1, capped to available cores.
+    cores = max(1, int(cpu_cores or 1))
+    return min(cores, (cores // 2) + 1)
+
+
 def _int_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -53,9 +60,11 @@ def _int_env(name: str, default: int) -> int:
 
 
 AUTO_PARALLEL_BASE = max(1, _auto_parallel_default())
-# Run 2 jobs per CPU core by default (overridable).
-PARALLEL_PER_CORE = max(1, _int_env("OPTIMO_WORKER_PARALLEL_PER_CORE", 2))
-MAX_PARALLEL = max(1, _int_env("OPTIMO_WORKER_PARALLEL", AUTO_PARALLEL_BASE * PARALLEL_PER_CORE))
+AUTO_PARALLEL_CTRADER = _ctrader_like_parallel_default(AUTO_PARALLEL_BASE)
+# Keep OPTIMO_WORKER_PARALLEL_PER_CORE for custom scaling; default is 1 to
+# preserve cTrader-like auto settings out of the box.
+PARALLEL_PER_CORE = max(1, _int_env("OPTIMO_WORKER_PARALLEL_PER_CORE", 1))
+MAX_PARALLEL = max(1, _int_env("OPTIMO_WORKER_PARALLEL", AUTO_PARALLEL_CTRADER * PARALLEL_PER_CORE))
 
 
 def now_utc_iso() -> str:

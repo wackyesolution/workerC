@@ -80,5 +80,6 @@ curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/provision/hetzn
   --image ghcr.io/<owner>/<image>:latest \
   --parallel auto
 ```
-With `--parallel auto`, effective worker slots = detected CPUs * `OPTIMO_WORKER_PARALLEL_PER_CORE` (default `2`).
+With `--parallel auto`, effective worker slots follow cTrader-like defaults
+(`floor(cpu / 2) + 1`) and are then multiplied by `OPTIMO_WORKER_PARALLEL_PER_CORE` (default `1`).
 dd

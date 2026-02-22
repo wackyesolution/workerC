@@ -16,7 +16,8 @@ curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/provision/hetzn
 ```
 
 If the image is private, run `docker login ghcr.io` first (or pass `--ghcr-user/--ghcr-token`).
-Default with `--parallel auto`: effective slots = detected CPUs * `OPTIMO_WORKER_PARALLEL_PER_CORE` (default `2`).
+Default with `--parallel auto`: effective slots follow cTrader-like defaults
+(`floor(cpu / 2) + 1`) and are then multiplied by `OPTIMO_WORKER_PARALLEL_PER_CORE` (default `1`).
 
 Optional: Telegram “online” message (be aware tokens can end up in shell history; prefer setting env in `/etc/optimo-worker-docker.env`):
 - via args: `--telegram-token ... --chat-id ... --public-url http://<IP>:1112`
