@@ -23,7 +23,7 @@ Optional:
   --ghcr-token <token>
 
 Example:
-  sudo bash install.sh --image ghcr.io/wackyesolution/workerc-ctrader:latest --parallel auto
+  sudo bash install.sh --image ghcr.io/wackyesolution/worckerc-ctrader_clipatched:latest --parallel auto
 EOF
 }
 
@@ -157,7 +157,7 @@ else
   echo "[bootstrap] env file not found ($ENV_FILE); using defaults"
 fi
 
-OPTIMO_WORKER_IMAGE="${OPTIMO_WORKER_IMAGE:-ghcr.io/wackyesolution/workerc-ctrader:latest}"
+OPTIMO_WORKER_IMAGE="${OPTIMO_WORKER_IMAGE:-ghcr.io/wackyesolution/worckerc-ctrader_clipatched:latest}"
 OPTIMO_WORKER_CONTAINER_NAME="${OPTIMO_WORKER_CONTAINER_NAME:-optimo-worker}"
 OPTIMO_WORKER_PORT="${OPTIMO_WORKER_PORT:-1112}"
 OPTIMO_WORKER_ROOT="${OPTIMO_WORKER_ROOT:-/var/lib/optimo-worker/runs}"

@@ -11,7 +11,7 @@ This avoids installing cTrader “natively” on the host.
 2) Install with one command (Docker + autostart + pull on reboot):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/provision/hetzner/install.sh | sudo bash -s -- \
-  --image ghcr.io/wackyesolution/workerc-ctrader:latest \
+  --image ghcr.io/wackyesolution/worckerc-ctrader_clipatched:latest \
   --parallel auto
 ```
 
