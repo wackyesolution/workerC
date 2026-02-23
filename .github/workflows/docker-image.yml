@@ -14,7 +14,6 @@ env:
   IMAGE_WORKER: ${{ github.repository_owner }}/workerc
   IMAGE_WORKER_CTRADER: ${{ github.repository_owner }}/workerc-ctrader
   IMAGE_WORKER_CTRADER_CLIPATCHED: ${{ github.repository_owner }}/worckerc-ctrader_clipatched
-  CTRADER_CONSOLE_BASE_IMAGE_CLIPATCHED: ghcr.io/spotware/ctrader-console:latest
 
 jobs:
   build:
@@ -52,10 +51,19 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile.ctrader
+          file: Dockerfile.ctrader.patched
           push: true
-          build-args: |
-            CTRADER_CONSOLE_BASE_IMAGE=${{ env.CTRADER_CONSOLE_BASE_IMAGE_CLIPATCHED }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_WORKER_CTRADER_CLIPATCHED }}:latest
             ${{ env.REGISTRY }}/${{ env.IMAGE_WORKER_CTRADER_CLIPATCHED }}:${{ github.sha }}
+
+      - name: Verify patched image payload
+        run: |
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_WORKER_CTRADER_CLIPATCHED }}:${{ github.sha }}"
+          docker pull "$IMG"
+          docker run --rm --entrypoint sh "$IMG" -lc \
+            'test -f /app/main.py && \
+             test -f /app/worker/cli_patched_host/Optimo.CliPatchedHost.dll && \
+             test -f /app/worker/cli_il_patcher/Optimo.CliIlPatcher.dll && \
+             dotnet --info >/dev/null'

@@ -1,0 +1,55 @@
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS cli_patched_host_build
+
+WORKDIR /src
+
+COPY cli_patched_host/Optimo.CliPatchedHost.csproj cli_patched_host/
+RUN dotnet restore cli_patched_host/Optimo.CliPatchedHost.csproj
+COPY cli_patched_host/ cli_patched_host/
+RUN dotnet publish cli_patched_host/Optimo.CliPatchedHost.csproj -c Release -o /out --no-self-contained
+
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS cli_il_patcher_build
+
+WORKDIR /src
+
+COPY cli_il_patcher/Optimo.CliIlPatcher.csproj cli_il_patcher/
+RUN dotnet restore cli_il_patcher/Optimo.CliIlPatcher.csproj
+COPY cli_il_patcher/ cli_il_patcher/
+RUN dotnet publish cli_il_patcher/Optimo.CliIlPatcher.csproj -c Release -o /out --no-self-contained
+
+FROM ghcr.io/spotware/ctrader-console:latest
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    OPTIMO_WORKER_ROOT=/data/worker_runs \
+    CTRADE_CLI_PATH=ctrader-cli \
+    CTRADE_CLI_DIR=/app \
+    OPTIMO_CUSTOM_CLI_PATCHED=1 \
+    OPTIMO_CLI_PATCHED_DOTNET_PATH=dotnet \
+    OPTIMO_CLI_PATCHED_HOST_PATH=/app/worker/cli_patched_host/Optimo.CliPatchedHost.dll
+
+# Install Python runtime (base image distro may vary).
+RUN (apt-get update && apt-get install -y --no-install-recommends python3 python3-pip ca-certificates && rm -rf /var/lib/apt/lists/*) \
+  || (apk add --no-cache python3 py3-pip ca-certificates)
+
+COPY requirements.txt /app/requirements.txt
+RUN python3 -m pip install --no-cache-dir -r /app/requirements.txt
+
+COPY main.py /app/main.py
+COPY __init__.py /app/__init__.py
+COPY --from=cli_patched_host_build /out /app/worker/cli_patched_host
+COPY --from=cli_il_patcher_build /out /app/worker/cli_il_patcher
+
+# Patch CLI state-machine behavior for persistent session mode:
+# - RobotDisposing: dispose instance and stay idle until host explicitly moves state.
+# - CurrentCommandParametersProvider: rebuild parameters per command (no stale cache).
+# - CommandParametersBuilderBase: disable first-command builder cache.
+RUN dotnet /app/worker/cli_il_patcher/Optimo.CliIlPatcher.dll --app-dir /app
+
+EXPOSE 1112
+
+# Base image sets an ENTRYPOINT to ctrader-cli (dotnet). Override it so this
+# container starts the FastAPI worker instead.
+ENTRYPOINT ["python3", "-m", "uvicorn"]
+CMD ["main:app", "--host", "0.0.0.0", "--port", "1112"]

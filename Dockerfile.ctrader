@@ -8,7 +8,7 @@ ENV PYTHONUNBUFFERED=1 \
     OPTIMO_WORKER_ROOT=/data/worker_runs \
     CTRADE_CLI_PATH=ctrader-cli \
     CTRADE_CLI_DIR=/app \
-    OPTIMO_CUSTOM_CLI_PATCHED=1 \
+    OPTIMO_CUSTOM_CLI_PATCHED=0 \
     OPTIMO_CLI_PATCHED_DOTNET_PATH=dotnet \
     OPTIMO_CLI_PATCHED_HOST_PATH=/app/worker/cli_patched_host/Optimo.CliPatchedHost.dll
 
