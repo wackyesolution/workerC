@@ -6,6 +6,7 @@ namespace Optimo.CliIlPatcher;
 internal static class Program
 {
     private const string InfraDllName = "cTrader.Console.Infrastructure.dll";
+    private const string InfraLinuxDllName = "cTrader.Console.Infrastructure.Linux.dll";
 
     private const string RobotTypeName =
         "cTrader.Console.Infrastructure.StateMachine.Strategies.RobotDisposingStateStrategy";
@@ -31,6 +32,9 @@ internal static class Program
     private const string CommandParametersBuilderBaseTypeName =
         "cTrader.Console.Infrastructure.Application.CommandLine.Builders.CommandParametersBuilderBase";
 
+    private const string LinuxFullAccessValidatorTypeName =
+        "cTrader.Console.Infrastructure.Linux.Application.CommandLine.Validators.LinuxFullAccessValidator";
+
     private static int Main(string[] args)
     {
         try
@@ -50,7 +54,12 @@ internal static class Program
                 return 1;
             }
 
-            BackupFile(infraDll);
+            var infraLinuxDll = Path.Combine(appDir, InfraLinuxDllName);
+            if (!File.Exists(infraLinuxDll))
+            {
+                Console.Error.WriteLine($"[ERR] Missing file: {infraLinuxDll}");
+                return 1;
+            }
 
             var resolver = new DefaultAssemblyResolver();
             resolver.AddSearchDirectory(appDir);
@@ -85,17 +94,40 @@ internal static class Program
                 changed = true;
             }
 
+            if (changed)
+            {
+                BackupFile(infraDll);
+                WriteAssemblyReplacing(infraDll, asm);
+            }
+            else
+            {
+                asm.Dispose();
+            }
+
+            var linuxAsm = AssemblyDefinition.ReadAssembly(infraLinuxDll, new ReaderParameters
+            {
+                AssemblyResolver = resolver,
+                ReadWrite = false,
+                InMemory = true,
+                ReadingMode = ReadingMode.Immediate,
+            });
+            if (PatchLinuxFullAccessValidator(linuxAsm, out var linuxAction))
+            {
+                actions.Add(linuxAction);
+                changed = true;
+                BackupFile(infraLinuxDll);
+                WriteAssemblyReplacing(infraLinuxDll, linuxAsm);
+            }
+            else
+            {
+                linuxAsm.Dispose();
+            }
+
             if (!changed)
             {
                 Console.WriteLine("[WARN] No patch applied (already patched or signature mismatch).");
                 return 1;
             }
-
-            var tempPath = infraDll + ".tmp";
-            asm.Write(tempPath);
-            asm.Dispose();
-            File.Copy(tempPath, infraDll, overwrite: true);
-            File.Delete(tempPath);
 
             Console.WriteLine("[OK] Patch applied:");
             foreach (var action in actions)
@@ -288,6 +320,58 @@ internal static class Program
             "CommandParametersBuilderBase.Build => always call DoBuild() (disable first-command parameter cache).";
 
         return true;
+    }
+
+    private static bool PatchLinuxFullAccessValidator(AssemblyDefinition asm, out string action)
+    {
+        action = string.Empty;
+
+        var module = asm.MainModule;
+        var targetType = module.Types.FirstOrDefault(t => t.FullName == LinuxFullAccessValidatorTypeName);
+        if (targetType is null)
+        {
+            Console.Error.WriteLine($"[WARN] Type not found: {LinuxFullAccessValidatorTypeName}");
+            return false;
+        }
+
+        var ctor = targetType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 2);
+        if (ctor is null || !ctor.HasBody)
+        {
+            Console.Error.WriteLine("[WARN] Constructor not found or has no body: LinuxFullAccessValidator..ctor");
+            return false;
+        }
+
+        var baseTypeDef = targetType.BaseType?.Resolve();
+        var baseCtor = baseTypeDef?.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0);
+        if (baseCtor is null)
+        {
+            Console.Error.WriteLine("[WARN] Base constructor not found for LinuxFullAccessValidator patch.");
+            return false;
+        }
+
+        ctor.Body.ExceptionHandlers.Clear();
+        ctor.Body.Variables.Clear();
+        ctor.Body.Instructions.Clear();
+        ctor.Body.InitLocals = false;
+
+        var il = ctor.Body.GetILProcessor();
+        var baseCtorRef = module.ImportReference(baseCtor);
+        il.Append(il.Create(OpCodes.Ldarg_0));
+        il.Append(il.Create(OpCodes.Call, baseCtorRef));
+        il.Append(il.Create(OpCodes.Ret));
+
+        action =
+            "LinuxFullAccessValidator..ctor => remove Linux security countdown (5..1) and startup delay.";
+        return true;
+    }
+
+    private static void WriteAssemblyReplacing(string targetPath, AssemblyDefinition asm)
+    {
+        var tempPath = targetPath + ".tmp";
+        asm.Write(tempPath);
+        asm.Dispose();
+        File.Copy(tempPath, targetPath, overwrite: true);
+        File.Delete(tempPath);
     }
 
     private static void BackupFile(string file)

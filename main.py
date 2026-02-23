@@ -946,6 +946,9 @@ async def _announce_online_startup() -> None:
             "custom_cli_patched": CUSTOM_CLI_PATCHED,
             "cli_patched_host_path": CLI_PATCHED_HOST_PATH,
             "cli_patched_cli_dir": CLI_PATCHED_CLI_DIR,
+            "callback_batch_size": CALLBACK_BATCH_SIZE,
+            "callback_batch_flush_seconds": CALLBACK_BATCH_FLUSH_SECONDS,
+            "callback_post_timeout_seconds": CALLBACK_POST_TIMEOUT_SECONDS,
         },
     )
 
@@ -1456,7 +1459,15 @@ async def run_start(payload: RunStartRequest):
             f"symbol={payload.symbol} period={payload.period}"
         ),
         kind="run",
-        extra={"run_id": run_id, "phase": "run_start", "symbol": payload.symbol, "period": payload.period},
+        extra={
+            "run_id": run_id,
+            "phase": "run_start",
+            "symbol": payload.symbol,
+            "period": payload.period,
+            "callback_enabled": bool(payload.callback_url),
+            "callback_batch_enabled": bool(run_state.callback_queue is not None),
+            "callback_batch_size": CALLBACK_BATCH_SIZE,
+        },
     )
 
     return RunStartResponse(run_id=run_id, max_parallel=MAX_PARALLEL, workdir=str(workdir))
