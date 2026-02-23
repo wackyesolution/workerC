@@ -59,6 +59,19 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    raw = raw.strip()
+    if not raw:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
 def _bool_env(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -99,6 +112,9 @@ CLI_PATCHED_HOST_PATH = str(
     os.environ.get("OPTIMO_CLI_PATCHED_HOST_PATH", "/app/worker/cli_patched_host/Optimo.CliPatchedHost.dll")
 ).strip() or "/app/worker/cli_patched_host/Optimo.CliPatchedHost.dll"
 CLI_PATCHED_CLI_DIR = str(os.environ.get("CTRADE_CLI_DIR", _guess_ctrade_cli_dir(CTRADE_BIN))).strip() or "/app"
+CALLBACK_BATCH_SIZE = max(1, _int_env("OPTIMO_WORKER_CALLBACK_BATCH_SIZE", 10))
+CALLBACK_BATCH_FLUSH_SECONDS = max(0.1, _float_env("OPTIMO_WORKER_CALLBACK_BATCH_FLUSH_SECONDS", 1.0))
+CALLBACK_POST_TIMEOUT_SECONDS = max(3, _int_env("OPTIMO_WORKER_CALLBACK_TIMEOUT_SECONDS", 10))
 
 
 def now_utc_iso() -> str:
@@ -171,6 +187,43 @@ def zip_dir_to_b64(dir_path: Path) -> str:
     except Exception:
         pass
     return base64.b64encode(data).decode("ascii")
+
+
+def zip_pass_dirs_to_b64(run_dir: Path, pass_ids: list[int]) -> str | None:
+    unique_ids: list[int] = []
+    seen: set[int] = set()
+    for raw in pass_ids:
+        pid = int(raw or 0)
+        if pid <= 0 or pid in seen:
+            continue
+        unique_ids.append(pid)
+        seen.add(pid)
+    if not unique_ids:
+        return None
+
+    tmp_zip = run_dir / f".callback_batch_{uuid.uuid4().hex}.zip"
+    files_written = 0
+    try:
+        with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for pass_id in unique_ids:
+                pass_dir = run_dir / str(pass_id)
+                if not pass_dir.exists():
+                    continue
+                for child in pass_dir.rglob("*"):
+                    if not child.is_file():
+                        continue
+                    rel = child.relative_to(pass_dir)
+                    zf.write(child, arcname=str(Path(str(pass_id)) / rel))
+                    files_written += 1
+        if files_written <= 0:
+            return None
+        data = tmp_zip.read_bytes()
+        return base64.b64encode(data).decode("ascii")
+    finally:
+        try:
+            tmp_zip.unlink()
+        except Exception:
+            pass
 
 
 def post_json(url: str, payload: dict[str, Any], timeout: int = 10) -> tuple[bool, str | None]:
@@ -785,12 +838,16 @@ class _RunState:
     enqueued_total: int = 0
     results: list[PassResult] = None  # type: ignore[assignment]
     active_procs: dict[int, subprocess.Popen] = None  # type: ignore[assignment]
+    callback_queue: asyncio.Queue[PassResult] | None = None
+    callback_task: asyncio.Task[Any] | None = None
 
     def __post_init__(self):
         if self.results is None:
             self.results = []
         if self.active_procs is None:
             self.active_procs = {}
+        if self.callback_queue is None and self.config.callback_url and CALLBACK_BATCH_SIZE > 1:
+            self.callback_queue = asyncio.Queue()
 
 
 APP_STARTED_AT = now_utc_iso()
@@ -1123,7 +1180,9 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
             if run.stop.is_set():
                 _release_run_if_idle(run)
 
-            if run.config.callback_url:
+            if run.callback_queue is not None:
+                await run.callback_queue.put(result)
+            elif run.config.callback_url:
                 asyncio.create_task(_notify_callback(run, result))
     finally:
         if cli_client:
@@ -1133,7 +1192,7 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
 
 async def _notify_callback(run: _RunState, result: PassResult) -> None:
     payload = result.model_dump()
-    ok, err = await asyncio.to_thread(post_json, run.config.callback_url or "", payload, 10)
+    ok, err = await asyncio.to_thread(post_json, run.config.callback_url or "", payload, CALLBACK_POST_TIMEOUT_SECONDS)
     if not ok:
         # Keep run throughput high: callback is best-effort and never blocks worker slots.
         _log_event(
@@ -1142,6 +1201,68 @@ async def _notify_callback(run: _RunState, result: PassResult) -> None:
             kind="run",
             extra={"run_id": run.run_id, "pass_id": result.pass_id, "phase": "callback", "error": err},
         )
+
+
+def _build_callback_batch_payload(run: _RunState, items: list[PassResult]) -> dict[str, Any]:
+    payload_items = [item.model_dump(exclude={"artifacts_zip_b64"}) for item in items]
+    payload: dict[str, Any] = {"run_id": run.run_id, "items": payload_items}
+    if not run.config.include_artifacts:
+        return payload
+
+    pass_ids = [int(item.pass_id) for item in items if int(item.pass_id or 0) > 0]
+    artifacts_batch_zip_b64 = zip_pass_dirs_to_b64(run.workdir, pass_ids)
+    if artifacts_batch_zip_b64:
+        payload["artifacts_batch_zip_b64"] = artifacts_batch_zip_b64
+    return payload
+
+
+async def _notify_callback_batch(run: _RunState, items: list[PassResult]) -> None:
+    if not items:
+        return
+    payload = await asyncio.to_thread(_build_callback_batch_payload, run, items)
+    ok, err = await asyncio.to_thread(post_json, run.config.callback_url or "", payload, CALLBACK_POST_TIMEOUT_SECONDS)
+    if ok:
+        return
+    ids = [str(item.pass_id) for item in items]
+    shown = ",".join(ids[:5])
+    if len(ids) > 5:
+        shown += ",..."
+    _log_event(
+        "ERROR",
+        f"callback batch failed for {len(items)} pass(es) [{shown}]: {err}",
+        kind="run",
+        extra={"run_id": run.run_id, "phase": "callback_batch", "error": err, "batch_size": len(items)},
+    )
+
+
+async def _callback_loop(run: _RunState) -> None:
+    q = run.callback_queue
+    if q is None or not run.config.callback_url:
+        return
+
+    pending: list[PassResult] = []
+    while True:
+        if run.stop.is_set() and q.empty() and not pending:
+            break
+        timeout = CALLBACK_BATCH_FLUSH_SECONDS if pending else 0.5
+        try:
+            item = await asyncio.wait_for(q.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            if pending:
+                await _notify_callback_batch(run, pending)
+                pending = []
+            continue
+        pending.append(item)
+        try:
+            q.task_done()
+        except Exception:
+            pass
+        if len(pending) >= CALLBACK_BATCH_SIZE:
+            await _notify_callback_batch(run, pending)
+            pending = []
+
+    if pending:
+        await _notify_callback_batch(run, pending)
 
 
 def _execute_pass_job(
@@ -1206,7 +1327,8 @@ def _execute_pass_job(
     metrics = rep or {}
 
     artifacts_zip_b64 = None
-    if run.config.include_artifacts:
+    callback_batch_enabled = bool(run.config.callback_url) and CALLBACK_BATCH_SIZE > 1
+    if run.config.include_artifacts and not callback_batch_enabled:
         artifacts_zip_b64 = zip_dir_to_b64(pass_dir)
 
     return PassResult(
@@ -1320,6 +1442,9 @@ async def run_start(payload: RunStartRequest):
     with STATE_LOCK:
         CURRENT_RUN = run_state
 
+    if run_state.callback_queue is not None:
+        run_state.callback_task = asyncio.create_task(_callback_loop(run_state))
+
     # spin up processors
     for i in range(MAX_PARALLEL):
         asyncio.create_task(_process_loop(run_state, i))
@@ -1368,12 +1493,22 @@ def run_results(run_id: str, limit: int = 2000, include_artifacts: int = 1):
     with_artifacts = bool(int(include_artifacts or 0))
     with STATE_LOCK:
         snapshot = list(run.results)[-limit:]
-        if with_artifacts:
-            results = snapshot
-        else:
-            results = [r.model_copy(update={"artifacts_zip_b64": None}) for r in snapshot]
         completed = len(run.results)
         total = run.enqueued_total
+    if with_artifacts:
+        results: list[PassResult] = []
+        for r in snapshot:
+            artifacts = r.artifacts_zip_b64
+            if artifacts is None and run.config.include_artifacts:
+                pass_dir = run.workdir / str(r.pass_id)
+                if pass_dir.exists():
+                    try:
+                        artifacts = zip_dir_to_b64(pass_dir)
+                    except Exception:
+                        artifacts = None
+            results.append(r.model_copy(update={"artifacts_zip_b64": artifacts}))
+    else:
+        results = [r.model_copy(update={"artifacts_zip_b64": None}) for r in snapshot]
     return RunResultsResponse(run_id=run_id, completed=completed, total_enqueued=total, results=results)
 
 
