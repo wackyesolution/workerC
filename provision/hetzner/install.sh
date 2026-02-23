@@ -12,6 +12,9 @@ Optional:
   --port <1112>
   --root <host_path_for_runs>
   --parallel <auto|N>
+  --custom-cli-patched <0|1>
+  --cli-patched-host-path </path/Optimo.CliPatchedHost.dll>
+  --ctrade-cli-dir </app>
   --container-name <optimo-worker>
   --telegram-token <token>   (optional) Send "online" message from worker
   --chat-id <id>             (optional) Telegram chat id (or set CHAT_DANIEL in env)
@@ -31,6 +34,9 @@ PARALLEL="auto"
 PARALLEL_PER_CORE="1"
 CONTAINER_NAME="optimo-worker"
 CTRADE_CLI_PATH="ctrader-cli"
+OPTIMO_CUSTOM_CLI_PATCHED="${OPTIMO_CUSTOM_CLI_PATCHED:-1}"
+OPTIMO_CLI_PATCHED_HOST_PATH="${OPTIMO_CLI_PATCHED_HOST_PATH:-/app/worker/cli_patched_host/Optimo.CliPatchedHost.dll}"
+CTRADE_CLI_DIR="${CTRADE_CLI_DIR:-/app}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 CHAT_ID="${CHAT_ID:-${CHAT_DANIEL:-}}"
 PUBLIC_URL="${PUBLIC_URL:-${OPTIMO_WORKER_PUBLIC_URL:-}}"
@@ -45,6 +51,9 @@ while [[ $# -gt 0 ]]; do
     --parallel) PARALLEL="${2:-}"; shift 2;;
     --container-name) CONTAINER_NAME="${2:-}"; shift 2;;
     --ctrade-cli-path) CTRADE_CLI_PATH="${2:-}"; shift 2;;
+    --custom-cli-patched) OPTIMO_CUSTOM_CLI_PATCHED="${2:-}"; shift 2;;
+    --cli-patched-host-path) OPTIMO_CLI_PATCHED_HOST_PATH="${2:-}"; shift 2;;
+    --ctrade-cli-dir) CTRADE_CLI_DIR="${2:-}"; shift 2;;
     --telegram-token) TELEGRAM_BOT_TOKEN="${2:-}"; shift 2;;
     --chat-id) CHAT_ID="${2:-}"; shift 2;;
     --public-url) PUBLIC_URL="${2:-}"; shift 2;;
@@ -115,6 +124,9 @@ OPTIMO_WORKER_ROOT=$ROOT
 OPTIMO_WORKER_PARALLEL=$PARALLEL
 OPTIMO_WORKER_PARALLEL_PER_CORE=$PARALLEL_PER_CORE
 CTRADE_CLI_PATH=$CTRADE_CLI_PATH
+OPTIMO_CUSTOM_CLI_PATCHED=$OPTIMO_CUSTOM_CLI_PATCHED
+OPTIMO_CLI_PATCHED_HOST_PATH=$OPTIMO_CLI_PATCHED_HOST_PATH
+CTRADE_CLI_DIR=$CTRADE_CLI_DIR
 TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
 CHAT_ID=$CHAT_ID
 OPTIMO_WORKER_PUBLIC_URL=$PUBLIC_URL
@@ -150,8 +162,11 @@ OPTIMO_WORKER_CONTAINER_NAME="${OPTIMO_WORKER_CONTAINER_NAME:-optimo-worker}"
 OPTIMO_WORKER_PORT="${OPTIMO_WORKER_PORT:-1112}"
 OPTIMO_WORKER_ROOT="${OPTIMO_WORKER_ROOT:-/var/lib/optimo-worker/runs}"
 OPTIMO_WORKER_PARALLEL="${OPTIMO_WORKER_PARALLEL:-auto}"
-OPTIMO_WORKER_PARALLEL_PER_CORE="${OPTIMO_WORKER_PARALLEL_PER_CORE:-2}"
+OPTIMO_WORKER_PARALLEL_PER_CORE="${OPTIMO_WORKER_PARALLEL_PER_CORE:-1}"
 CTRADE_CLI_PATH="${CTRADE_CLI_PATH:-ctrader-cli}"
+OPTIMO_CUSTOM_CLI_PATCHED="${OPTIMO_CUSTOM_CLI_PATCHED:-1}"
+OPTIMO_CLI_PATCHED_HOST_PATH="${OPTIMO_CLI_PATCHED_HOST_PATH:-/app/worker/cli_patched_host/Optimo.CliPatchedHost.dll}"
+CTRADE_CLI_DIR="${CTRADE_CLI_DIR:-/app}"
 
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 CHAT_ID="${CHAT_ID:-${CHAT_DANIEL:-}}"
@@ -219,6 +234,9 @@ run_container() {
     -e OPTIMO_WORKER_PARALLEL_PER_CORE="$OPTIMO_WORKER_PARALLEL_PER_CORE" \
     -e OPTIMO_WORKER_ROOT=/data/worker_runs \
     -e CTRADE_CLI_PATH="$CTRADE_CLI_PATH" \
+    -e OPTIMO_CUSTOM_CLI_PATCHED="$OPTIMO_CUSTOM_CLI_PATCHED" \
+    -e OPTIMO_CLI_PATCHED_HOST_PATH="$OPTIMO_CLI_PATCHED_HOST_PATH" \
+    -e CTRADE_CLI_DIR="$CTRADE_CLI_DIR" \
     "${tg_args[@]}" \
     -v "${OPTIMO_WORKER_ROOT}:/data/worker_runs" \
     "$OPTIMO_WORKER_IMAGE"

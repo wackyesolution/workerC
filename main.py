@@ -59,12 +59,46 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    text = str(raw).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _guess_ctrade_cli_dir(cli_bin: str) -> str:
+    value = str(cli_bin or "").strip()
+    if not value:
+        return "/app"
+    try:
+        p = Path(value).expanduser()
+        if p.exists():
+            if p.is_file():
+                return str(p.resolve().parent)
+            if p.is_dir():
+                return str(p.resolve())
+    except Exception:
+        pass
+    return "/app"
+
+
 AUTO_PARALLEL_BASE = max(1, _auto_parallel_default())
 AUTO_PARALLEL_CTRADER = _ctrader_like_parallel_default(AUTO_PARALLEL_BASE)
 # Keep OPTIMO_WORKER_PARALLEL_PER_CORE for custom scaling; default is 1 to
 # preserve cTrader-like auto settings out of the box.
 PARALLEL_PER_CORE = max(1, _int_env("OPTIMO_WORKER_PARALLEL_PER_CORE", 1))
 MAX_PARALLEL = max(1, _int_env("OPTIMO_WORKER_PARALLEL", AUTO_PARALLEL_CTRADER * PARALLEL_PER_CORE))
+CUSTOM_CLI_PATCHED = _bool_env("OPTIMO_CUSTOM_CLI_PATCHED", True)
+CLI_PATCHED_DOTNET_PATH = str(os.environ.get("OPTIMO_CLI_PATCHED_DOTNET_PATH", "dotnet")).strip() or "dotnet"
+CLI_PATCHED_HOST_PATH = str(
+    os.environ.get("OPTIMO_CLI_PATCHED_HOST_PATH", "/app/worker/cli_patched_host/Optimo.CliPatchedHost.dll")
+).strip() or "/app/worker/cli_patched_host/Optimo.CliPatchedHost.dll"
+CLI_PATCHED_CLI_DIR = str(os.environ.get("CTRADE_CLI_DIR", _guess_ctrade_cli_dir(CTRADE_BIN))).strip() or "/app"
 
 
 def now_utc_iso() -> str:
@@ -304,6 +338,331 @@ def run_backtest(
     return success or reports_ready()
 
 
+class _PatchedCliClient:
+    def __init__(
+        self,
+        slot_index: int,
+        on_proc_start: Optional[Callable[[subprocess.Popen[str]], None]] = None,
+        on_proc_end: Optional[Callable[[int], None]] = None,
+    ):
+        self.slot_index = int(slot_index)
+        self._seq = 0
+        self._on_proc_start = on_proc_start
+        self._on_proc_end = on_proc_end
+        self._lock = threading.RLock()
+        self._cv = threading.Condition(self._lock)
+        self._responses: dict[str, dict[str, Any]] = {}
+        self._stderr_tail: deque[str] = deque(maxlen=200)
+        self._closed = False
+        self._generation = 0
+        self.proc: subprocess.Popen[str] | None = None
+        self._stdout_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
+        self._start_process()
+
+    @property
+    def pid(self) -> int:
+        if self.proc and self.proc.pid:
+            return int(self.proc.pid)
+        return 0
+
+    def _start_process(self) -> None:
+        with self._lock:
+            self._closed = False
+            self._responses.clear()
+            self._generation += 1
+        cmd = [CLI_PATCHED_DOTNET_PATH, CLI_PATCHED_HOST_PATH, "--cli-dir", CLI_PATCHED_CLI_DIR]
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self.proc = proc
+        if self._on_proc_start:
+            try:
+                self._on_proc_start(proc)
+            except Exception:
+                pass
+        self._stdout_thread = threading.Thread(target=self._stdout_reader, daemon=True)
+        self._stderr_thread = threading.Thread(target=self._stderr_reader, daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def _stdout_reader(self) -> None:
+        proc = self.proc
+        if proc is None or proc.stdout is None:
+            return
+        for raw in proc.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception:
+                with self._lock:
+                    self._stderr_tail.append(f"[patched-host-stdout] {line}")
+                    self._cv.notify_all()
+                continue
+            req_id = str(payload.get("id") or "").strip()
+            if not req_id:
+                with self._lock:
+                    self._stderr_tail.append(f"[patched-host-stdout-id-missing] {line}")
+                    self._cv.notify_all()
+                continue
+            with self._lock:
+                self._responses[req_id] = payload
+                self._cv.notify_all()
+        with self._lock:
+            self._cv.notify_all()
+
+    def _stderr_reader(self) -> None:
+        proc = self.proc
+        if proc is None or proc.stderr is None:
+            return
+        for raw in proc.stderr:
+            line = raw.rstrip("\n")
+            if not line:
+                continue
+            with self._lock:
+                self._stderr_tail.append(line)
+                self._cv.notify_all()
+        with self._lock:
+            self._cv.notify_all()
+
+    def _stderr_snapshot(self, max_lines: int = 20) -> str:
+        with self._lock:
+            lines = list(self._stderr_tail)[-max_lines:]
+        return "\n".join(lines).strip()
+
+    def execute(self, args: list[str], timeout_seconds: int) -> dict[str, Any]:
+        timeout = max(1, int(timeout_seconds))
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("patched CLI client is closed")
+            if self.proc is None:
+                raise RuntimeError("patched CLI host is not started")
+            if self.proc.poll() is not None:
+                detail = self._stderr_snapshot()
+                raise RuntimeError(f"patched CLI host is not running (rc={self.proc.returncode}). {detail}".strip())
+            if self.proc.stdin is None:
+                raise RuntimeError("patched CLI host stdin is unavailable")
+
+            self._seq += 1
+            generation = int(self._generation)
+            req_id = f"{self.slot_index}-{self._seq}"
+            payload = json.dumps({"id": req_id, "args": list(args)}, ensure_ascii=False)
+            self.proc.stdin.write(payload + "\n")
+            self.proc.stdin.flush()
+
+            deadline = time.time() + timeout
+            while req_id not in self._responses:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise TimeoutError(f"patched CLI command timeout after {timeout}s")
+                if self._closed:
+                    raise RuntimeError("patched CLI client closed during command execution")
+                if generation != self._generation:
+                    raise RuntimeError("patched CLI host restarted during command execution")
+                if self.proc.poll() is not None:
+                    detail = self._stderr_snapshot()
+                    raise RuntimeError(
+                        f"patched CLI host exited during command (rc={self.proc.returncode}). {detail}".strip()
+                    )
+                self._cv.wait(timeout=min(remaining, 0.5))
+            return dict(self._responses.pop(req_id))
+
+    def reset_process(self) -> None:
+        self.close()
+        self._start_process()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            proc = self.proc
+            self.proc = None
+            self._responses.clear()
+            self._cv.notify_all()
+        if not proc:
+            return
+        try:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
+        if self._on_proc_end:
+            try:
+                self._on_proc_end(int(proc.pid or 0))
+            except Exception:
+                pass
+
+
+def _create_patched_cli_client(run: "_RunState", worker_index: int) -> _PatchedCliClient:
+    if not Path(CLI_PATCHED_HOST_PATH).exists():
+        raise RuntimeError(f"patched CLI host not found at {CLI_PATCHED_HOST_PATH}")
+    try:
+        client = _PatchedCliClient(
+            worker_index,
+            on_proc_start=lambda proc: _track_run_proc_start(run, proc),
+            on_proc_end=lambda pid: _track_run_proc_end(run, pid),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"failed to start patched CLI host for slot {worker_index}: {exc}") from exc
+
+    _log_event(
+        "INFO",
+        f"patched CLI host started for slot {worker_index} (pid={client.pid})",
+        kind="run",
+        extra={"run_id": run.run_id, "worker_slot": worker_index, "phase": "patched_cli_started", "pid": client.pid},
+    )
+    return client
+
+
+def run_backtest_with_patched_cli(
+    cli_client: _PatchedCliClient,
+    algo_path: Path,
+    cbotset_path: Path,
+    start: str,
+    end: str,
+    data_mode: Literal["ticks", "m1"],
+    ctid: str,
+    pwd_file: Path,
+    account: str,
+    symbol: str,
+    period: str,
+    report_html: Path,
+    report_json: Path,
+    log_path: Path,
+    timeout_seconds: int,
+    balance: float | None,
+    stop_requested: Optional[Callable[[], bool]] = None,
+) -> bool:
+    args = [
+        "backtest",
+        str(algo_path),
+        str(cbotset_path),
+        f"--start={start}",
+        f"--end={end}",
+        f"--data-mode={data_mode}",
+        f"--ctid={ctid}",
+        f"--pwd-file={str(pwd_file)}",
+        f"--account={account}",
+        f"--symbol={symbol}",
+        f"--period={period}",
+        f"--report={str(report_html)}",
+        f"--report-json={str(report_json)}",
+    ]
+    if balance is not None:
+        args.append(f"--balance={balance}")
+
+    cmd_display = [f"{CLI_PATCHED_DOTNET_PATH} {CLI_PATCHED_HOST_PATH}", *args]
+    stop_flag = threading.Event()
+    done = threading.Event()
+    result_box: dict[str, Any] = {}
+    error_box: dict[str, Exception] = {}
+
+    def reports_ready() -> bool:
+        return (
+            report_html.exists()
+            and report_json.exists()
+            and report_html.stat().st_size > 0
+            and report_json.stat().st_size > 0
+        )
+
+    def _invoke() -> None:
+        try:
+            result_box["response"] = cli_client.execute(args, timeout_seconds=max(5, int(timeout_seconds)) + 30)
+        except Exception as exc:
+            error_box["error"] = exc
+        finally:
+            done.set()
+
+    worker_thread = threading.Thread(target=_invoke, daemon=True)
+    start_ts = time.time()
+    outcome = "unknown"
+    success = False
+
+    with log_path.open("w", encoding="utf-8") as logf:
+        logf.write(f"[started_at_utc] {now_utc_iso()}\n")
+        logf.write(f"[command] {' '.join(shlex.quote(x) for x in cmd_display)}\n")
+        logf.write(f"[execution] patched_cli_host pid={cli_client.pid}\n\n")
+        logf.flush()
+        worker_thread.start()
+        while not done.wait(timeout=0.5):
+            if stop_requested and stop_requested():
+                stop_flag.set()
+                outcome = "stopped_by_request"
+                try:
+                    cli_client.reset_process()
+                except Exception:
+                    pass
+                break
+            if timeout_seconds and (time.time() - start_ts) >= timeout_seconds:
+                stop_flag.set()
+                outcome = "timeout"
+                try:
+                    cli_client.reset_process()
+                except Exception:
+                    pass
+                break
+
+        if done.is_set() and not stop_flag.is_set():
+            err = error_box.get("error")
+            if err is not None:
+                outcome = f"patched_host_error_{type(err).__name__}"
+                logf.write(f"[patched_host_error] {err}\n")
+            else:
+                response = result_box.get("response") or {}
+                raw_exit_code = response.get("exit_code")
+                if raw_exit_code is None:
+                    raw_exit_code = response.get("exitCode")
+                if raw_exit_code is None:
+                    raw_exit_code = 1
+                exit_code = int(raw_exit_code)
+                stdout = str(response.get("stdout") or "")
+                stderr = str(response.get("stderr") or "")
+                if stdout:
+                    logf.write("\n[patched_host_stdout]\n")
+                    logf.write(stdout)
+                    if not stdout.endswith("\n"):
+                        logf.write("\n")
+                if stderr:
+                    logf.write("\n[patched_host_stderr]\n")
+                    logf.write(stderr)
+                    if not stderr.endswith("\n"):
+                        logf.write("\n")
+                if exit_code == 0 and reports_ready():
+                    success = True
+                    outcome = "reports_ready"
+                else:
+                    outcome = f"process_exited_rc_{exit_code}"
+
+        worker_thread.join(timeout=2.0)
+        elapsed_total = round(max(0.0, time.time() - start_ts), 3)
+        logf.write(f"\n[finished_at_utc] {now_utc_iso()}\n")
+        logf.write(f"[elapsed_seconds_total] {elapsed_total}\n")
+        logf.write(f"[outcome] {outcome}\n")
+        logf.flush()
+
+    return success or reports_ready()
+
+
 def _resolve_ctrade_cmd_prefix() -> list[str]:
     raw = str(CTRADE_BIN or "").strip() or "ctrader-cli"
     try:
@@ -517,11 +876,20 @@ async def _request_access_log(request: Request, call_next):
 @app.on_event("startup")
 async def _announce_online_startup() -> None:
     host, port = _guess_bind_info()
+    cli_mode = "custom_patched" if CUSTOM_CLI_PATCHED else "default_subprocess"
     _log_event(
         "INFO",
-        f"Worker server running at {host}:{port} (max_parallel={MAX_PARALLEL})",
+        f"Worker server running at {host}:{port} (max_parallel={MAX_PARALLEL}, cli_mode={cli_mode})",
         kind="startup",
-        extra={"host": host, "port": port, "max_parallel": MAX_PARALLEL},
+        extra={
+            "host": host,
+            "port": port,
+            "max_parallel": MAX_PARALLEL,
+            "cli_mode": cli_mode,
+            "custom_cli_patched": CUSTOM_CLI_PATCHED,
+            "cli_patched_host_path": CLI_PATCHED_HOST_PATH,
+            "cli_patched_cli_dir": CLI_PATCHED_CLI_DIR,
+        },
     )
 
     token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -670,72 +1038,97 @@ def _stop_and_unlock_run(run: _RunState, reason: str) -> dict[str, Any]:
 
 
 async def _process_loop(run: _RunState, worker_index: int) -> None:
-    while not run.stop.is_set():
+    cli_client: _PatchedCliClient | None = None
+    if CUSTOM_CLI_PATCHED:
         try:
-            job = await asyncio.wait_for(run.queue.get(), timeout=0.5)
-        except asyncio.TimeoutError:
-            continue
-        if run.stop.is_set():
-            run.queue.task_done()
-            break
-
-        with STATE_LOCK:
-            run.in_flight += 1
-
-        started_at = now_utc_iso()
-        started_perf = time.perf_counter()
-        _log_event(
-            "INFO",
-            f"pass {job.pass_id} started (run_id={run.run_id}, worker_slot={worker_index})",
-            kind="run",
-            extra={"run_id": run.run_id, "pass_id": job.pass_id, "worker_slot": worker_index, "phase": "started"},
-        )
-        try:
-            result = await asyncio.to_thread(_execute_pass_job, run, job, worker_index)
+            cli_client = _create_patched_cli_client(run, worker_index)
         except Exception as exc:
-            result = PassResult(
-                run_id=run.run_id,
-                pass_id=job.pass_id,
-                status="Failed",
-                started_at_utc=started_at,
-                finished_at_utc=now_utc_iso(),
-                elapsed_seconds_total=None,
-                metrics={},
-                artifacts_zip_b64=None,
-                error=str(exc),
+            run.stop.set()
+            dropped = _drain_run_queue(run)
+            _log_event(
+                "ERROR",
+                f"patched cli init failed for slot {worker_index}: {exc} (dropped={dropped})",
+                kind="run",
+                extra={
+                    "run_id": run.run_id,
+                    "worker_slot": worker_index,
+                    "phase": "patched_cli_init_error",
+                    "dropped": dropped,
+                },
             )
-        elapsed_total = round(max(0.0, time.perf_counter() - started_perf), 3)
-        result.started_at_utc = started_at
-        result.finished_at_utc = now_utc_iso()
-        result.elapsed_seconds_total = elapsed_total
-
-        with STATE_LOCK:
-            run.results.append(result)
-            run.in_flight -= 1
-
-        _log_event(
-            "INFO" if result.status == "Completed" else "ERROR",
-            (
-                f"pass {job.pass_id} finished status={result.status} "
-                f"elapsed_total_seconds={elapsed_total} (run_id={run.run_id})"
-            ),
-            kind="run",
-            extra={
-                "run_id": run.run_id,
-                "pass_id": job.pass_id,
-                "status": result.status,
-                "phase": "finished",
-                "elapsed_seconds_total": elapsed_total,
-            },
-        )
-
-        run.queue.task_done()
-        if run.stop.is_set():
             _release_run_if_idle(run)
+            return
 
-        if run.config.callback_url:
-            asyncio.create_task(_notify_callback(run, result))
-    _release_run_if_idle(run)
+    try:
+        while not run.stop.is_set():
+            try:
+                job = await asyncio.wait_for(run.queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            if run.stop.is_set():
+                run.queue.task_done()
+                break
+
+            with STATE_LOCK:
+                run.in_flight += 1
+
+            started_at = now_utc_iso()
+            started_perf = time.perf_counter()
+            _log_event(
+                "INFO",
+                f"pass {job.pass_id} started (run_id={run.run_id}, worker_slot={worker_index})",
+                kind="run",
+                extra={"run_id": run.run_id, "pass_id": job.pass_id, "worker_slot": worker_index, "phase": "started"},
+            )
+            try:
+                result = await asyncio.to_thread(_execute_pass_job, run, job, worker_index, cli_client)
+            except Exception as exc:
+                result = PassResult(
+                    run_id=run.run_id,
+                    pass_id=job.pass_id,
+                    status="Failed",
+                    started_at_utc=started_at,
+                    finished_at_utc=now_utc_iso(),
+                    elapsed_seconds_total=None,
+                    metrics={},
+                    artifacts_zip_b64=None,
+                    error=str(exc),
+                )
+            elapsed_total = round(max(0.0, time.perf_counter() - started_perf), 3)
+            result.started_at_utc = started_at
+            result.finished_at_utc = now_utc_iso()
+            result.elapsed_seconds_total = elapsed_total
+
+            with STATE_LOCK:
+                run.results.append(result)
+                run.in_flight -= 1
+
+            _log_event(
+                "INFO" if result.status == "Completed" else "ERROR",
+                (
+                    f"pass {job.pass_id} finished status={result.status} "
+                    f"elapsed_total_seconds={elapsed_total} (run_id={run.run_id})"
+                ),
+                kind="run",
+                extra={
+                    "run_id": run.run_id,
+                    "pass_id": job.pass_id,
+                    "status": result.status,
+                    "phase": "finished",
+                    "elapsed_seconds_total": elapsed_total,
+                },
+            )
+
+            run.queue.task_done()
+            if run.stop.is_set():
+                _release_run_if_idle(run)
+
+            if run.config.callback_url:
+                asyncio.create_task(_notify_callback(run, result))
+    finally:
+        if cli_client:
+            cli_client.close()
+        _release_run_if_idle(run)
 
 
 async def _notify_callback(run: _RunState, result: PassResult) -> None:
@@ -751,7 +1144,12 @@ async def _notify_callback(run: _RunState, result: PassResult) -> None:
         )
 
 
-def _execute_pass_job(run: _RunState, job: PassJob, worker_index: int) -> PassResult:
+def _execute_pass_job(
+    run: _RunState,
+    job: PassJob,
+    worker_index: int,
+    cli_client: _PatchedCliClient | None = None,
+) -> PassResult:
     pass_dir = run.workdir / str(job.pass_id)
     ensure_dir(pass_dir)
 
@@ -763,26 +1161,47 @@ def _execute_pass_job(run: _RunState, job: PassJob, worker_index: int) -> PassRe
 
     write_events(events_path)
     write_cbotset(cbotset_path, job.parameters, run.config.symbol, run.config.period)
-    ok = run_backtest(
-        algo_path=run.algo_path,
-        cbotset_path=cbotset_path,
-        start=run.config.start,
-        end=run.config.end,
-        data_mode=run.config.data_mode,
-        ctid=run.config.ctid,
-        pwd_file=run.pwd_path,
-        account=run.config.account,
-        symbol=run.config.symbol,
-        period=run.config.period,
-        report_html=report_html,
-        report_json=report_json,
-        log_path=log_path,
-        timeout_seconds=int(run.config.timeout_seconds),
-        balance=run.config.balance,
-        stop_requested=run.stop.is_set,
-        on_proc_start=lambda proc: _track_run_proc_start(run, proc),
-        on_proc_end=lambda pid: _track_run_proc_end(run, pid),
-    )
+    if cli_client is not None:
+        ok = run_backtest_with_patched_cli(
+            cli_client=cli_client,
+            algo_path=run.algo_path,
+            cbotset_path=cbotset_path,
+            start=run.config.start,
+            end=run.config.end,
+            data_mode=run.config.data_mode,
+            ctid=run.config.ctid,
+            pwd_file=run.pwd_path,
+            account=run.config.account,
+            symbol=run.config.symbol,
+            period=run.config.period,
+            report_html=report_html,
+            report_json=report_json,
+            log_path=log_path,
+            timeout_seconds=int(run.config.timeout_seconds),
+            balance=run.config.balance,
+            stop_requested=run.stop.is_set,
+        )
+    else:
+        ok = run_backtest(
+            algo_path=run.algo_path,
+            cbotset_path=cbotset_path,
+            start=run.config.start,
+            end=run.config.end,
+            data_mode=run.config.data_mode,
+            ctid=run.config.ctid,
+            pwd_file=run.pwd_path,
+            account=run.config.account,
+            symbol=run.config.symbol,
+            period=run.config.period,
+            report_html=report_html,
+            report_json=report_json,
+            log_path=log_path,
+            timeout_seconds=int(run.config.timeout_seconds),
+            balance=run.config.balance,
+            stop_requested=run.stop.is_set,
+            on_proc_start=lambda proc: _track_run_proc_start(run, proc),
+            on_proc_end=lambda pid: _track_run_proc_end(run, pid),
+        )
     rep = parse_report(report_json) if ok else None
     metrics = rep or {}
 

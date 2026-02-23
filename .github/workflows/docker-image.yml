@@ -1,4 +1,4 @@
-name: Build and Push to GHCR
+name: Build and Push worker-ctrader to GHCR
 
 on:
   push:
@@ -11,8 +11,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_WORKER: ${{ github.repository_owner }}/workerc
-  IMAGE_WORKER_CTRADER: ${{ github.repository_owner }}/workerc-ctrader
+  IMAGE_NAME: ${{ github.repository_owner }}/workerc-ctrader
 
 jobs:
   build:
@@ -26,16 +25,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build+push (worker)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_WORKER }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_WORKER }}:${{ github.sha }}
-
       - name: Build+push (worker-ctrader)
         uses: docker/build-push-action@v5
         with:
@@ -43,5 +32,5 @@ jobs:
           file: Dockerfile.ctrader
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_WORKER_CTRADER }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_WORKER_CTRADER }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
