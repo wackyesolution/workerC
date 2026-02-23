@@ -341,13 +341,19 @@ internal static class Program
             return false;
         }
 
-        var baseTypeDef = targetType.BaseType?.Resolve();
-        var baseCtor = baseTypeDef?.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0);
-        if (baseCtor is null)
+        var baseTypeRef = targetType.BaseType;
+        if (baseTypeRef is null)
         {
-            Console.Error.WriteLine("[WARN] Base constructor not found for LinuxFullAccessValidator patch.");
+            Console.Error.WriteLine("[WARN] Base type not found for LinuxFullAccessValidator patch.");
             return false;
         }
+
+        var baseCtorRef = new MethodReference(".ctor", module.TypeSystem.Void, baseTypeRef)
+        {
+            HasThis = true,
+            ExplicitThis = false,
+            CallingConvention = MethodCallingConvention.Default,
+        };
 
         ctor.Body.ExceptionHandlers.Clear();
         ctor.Body.Variables.Clear();
@@ -355,7 +361,6 @@ internal static class Program
         ctor.Body.InitLocals = false;
 
         var il = ctor.Body.GetILProcessor();
-        var baseCtorRef = module.ImportReference(baseCtor);
         il.Append(il.Create(OpCodes.Ldarg_0));
         il.Append(il.Create(OpCodes.Call, baseCtorRef));
         il.Append(il.Create(OpCodes.Ret));
