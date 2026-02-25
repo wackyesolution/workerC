@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -171,6 +172,104 @@ def parse_report(report_json: Path) -> dict[str, Any] | None:
         "maxBalanceDrawdownAbsolute": equity.get("maxBalanceDrawdownAbsolute"),
         "averageTrade": avg_trade.get("all") if isinstance(avg_trade, dict) else avg_trade,
     }
+
+
+def _extract_json_from_output(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    obj_idx = s.find("{")
+    arr_idx = s.find("[")
+    candidates = [i for i in (obj_idx, arr_idx) if i != -1]
+    if not candidates:
+        return s
+    return s[min(candidates):].strip()
+
+
+def _decode_pwd_bytes(*, pwd_b64: Optional[str], pwd_text: Optional[str]) -> bytes:
+    if pwd_b64:
+        try:
+            return base64.b64decode(pwd_b64.encode("ascii"))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid pwd_b64 payload: {exc}")
+    if pwd_text is not None:
+        return str(pwd_text).encode("utf-8")
+    raise HTTPException(status_code=400, detail="pwd_b64 or pwd_text is required")
+
+
+def _run_ctrader_info_json(
+    *,
+    command: Literal["accounts", "symbols"],
+    ctid: str,
+    pwd_bytes: bytes,
+    account: Optional[str] = None,
+    broker: Optional[str] = None,
+    timeout_seconds: int = 120,
+) -> object:
+    ensure_dir(WORKER_ROOT / "tmp")
+    fd, tmp_name = tempfile.mkstemp(prefix="ctrader_pwd_", suffix=".txt", dir=str((WORKER_ROOT / "tmp").resolve()))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        tmp_path.write_bytes(pwd_bytes)
+        try:
+            os.chmod(tmp_path, 0o600)
+        except Exception:
+            pass
+
+        args = [
+            command,
+            f"--ctid={ctid}",
+            f"--pwd-file={str(tmp_path)}",
+        ]
+        if broker and str(broker).strip():
+            args.append(f"--broker={str(broker).strip()}")
+        if command == "symbols":
+            account_value = str(account or "").strip()
+            if not account_value:
+                raise HTTPException(status_code=400, detail="account is required")
+            args.append(f"--account={account_value}")
+
+        cmd = [*_resolve_ctrade_cmd_prefix(), *args]
+        try:
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=max(5, int(timeout_seconds or 120)),
+            )
+        except FileNotFoundError:
+            raise HTTPException(status_code=500, detail=f"cTrader CLI not found: {cmd[0]}")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(
+                status_code=504,
+                detail=f"cTrader CLI timed out after {max(5, int(timeout_seconds or 120))}s",
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to run cTrader CLI: {exc}")
+
+        if res.returncode != 0:
+            stderr = (res.stderr or "").strip()
+            stdout = (res.stdout or "").strip()
+            detail = stderr or stdout or f"returncode={res.returncode}"
+            raise HTTPException(status_code=502, detail=f"cTrader CLI error: {detail[:2000]}")
+
+        out = _extract_json_from_output(res.stdout or "")
+        if not out:
+            return []
+        try:
+            return json.loads(out)
+        except Exception:
+            raise HTTPException(
+                status_code=502,
+                detail=f"cTrader CLI returned non-JSON output (first 2000 chars): {out[:2000]}",
+            )
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def zip_dir_to_b64(dir_path: Path) -> str:
@@ -844,6 +943,15 @@ class CompileSourceResponse(BaseModel):
     metadata_b64: Optional[str] = None
     metadata_name: Optional[str] = None
     workdir: str
+
+
+class CTraderInfoRequest(BaseModel):
+    ctid: str
+    broker: Optional[str] = None
+    account: Optional[str] = None
+    pwd_b64: Optional[str] = None
+    pwd_text: Optional[str] = None
+    timeout_seconds: int = 120
 
 
 @dataclass
@@ -1608,6 +1716,70 @@ def status():
         current_run_id=run.run_id if run else None,
         started_at_utc=APP_STARTED_AT,
     )
+
+
+@app.post("/ctrader/accounts")
+@app.post("/api/ctrader/accounts")
+def ctrader_accounts(payload: CTraderInfoRequest):
+    with STATE_LOCK:
+        run = CURRENT_RUN
+    busy, _, _ = _is_busy(run)
+    if busy:
+        raise HTTPException(status_code=409, detail="Worker is busy")
+
+    ctid = str(payload.ctid or "").strip()
+    if not ctid:
+        raise HTTPException(status_code=400, detail="ctid is required")
+    pwd_bytes = _decode_pwd_bytes(pwd_b64=payload.pwd_b64, pwd_text=payload.pwd_text)
+    data = _run_ctrader_info_json(
+        command="accounts",
+        ctid=ctid,
+        pwd_bytes=pwd_bytes,
+        broker=payload.broker,
+        timeout_seconds=int(payload.timeout_seconds or 120),
+    )
+    items = data if isinstance(data, list) else []
+    _log_event(
+        "INFO",
+        f"ctrader accounts fetched for ctid={ctid} ({len(items)} account(s))",
+        kind="ctrader",
+        extra={"ctid": ctid, "accounts_count": len(items)},
+    )
+    return {"items": items}
+
+
+@app.post("/ctrader/symbols")
+@app.post("/api/ctrader/symbols")
+def ctrader_symbols(payload: CTraderInfoRequest):
+    with STATE_LOCK:
+        run = CURRENT_RUN
+    busy, _, _ = _is_busy(run)
+    if busy:
+        raise HTTPException(status_code=409, detail="Worker is busy")
+
+    ctid = str(payload.ctid or "").strip()
+    if not ctid:
+        raise HTTPException(status_code=400, detail="ctid is required")
+    account = str(payload.account or "").strip()
+    if not account:
+        raise HTTPException(status_code=400, detail="account is required")
+    pwd_bytes = _decode_pwd_bytes(pwd_b64=payload.pwd_b64, pwd_text=payload.pwd_text)
+    data = _run_ctrader_info_json(
+        command="symbols",
+        ctid=ctid,
+        account=account,
+        pwd_bytes=pwd_bytes,
+        broker=payload.broker,
+        timeout_seconds=int(payload.timeout_seconds or 120),
+    )
+    items = data if isinstance(data, list) else []
+    _log_event(
+        "INFO",
+        f"ctrader symbols fetched for ctid={ctid} account={account} ({len(items)} symbol(s))",
+        kind="ctrader",
+        extra={"ctid": ctid, "account": account, "symbols_count": len(items)},
+    )
+    return {"items": items}
 
 
 @app.get("/logs/live")
