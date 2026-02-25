@@ -824,6 +824,28 @@ class RunResultsResponse(BaseModel):
     results: list[PassResult]
 
 
+class CompileSourceRequest(BaseModel):
+    source_zip_b64: str
+    project_relpath: Optional[str] = None
+    timeout_seconds: Optional[int] = None
+    include_full_logs: bool = False
+
+
+class CompileSourceResponse(BaseModel):
+    ok: bool = True
+    algo_b64: str
+    algo_name: str
+    compile_target: str
+    command: list[str] = Field(default_factory=list)
+    stdout_tail: str = ""
+    stderr_tail: str = ""
+    stdout_full: Optional[str] = None
+    stderr_full: Optional[str] = None
+    metadata_b64: Optional[str] = None
+    metadata_name: Optional[str] = None
+    workdir: str
+
+
 @dataclass
 class _RunState:
     run_id: str
@@ -897,6 +919,159 @@ def _guess_bind_info() -> tuple[str, int]:
     except Exception:
         port = 1112
     return host, port
+
+
+def _tail_text(text: str, max_chars: int = 4000) -> str:
+    value = str(text or "")
+    if len(value) <= max_chars:
+        return value
+    return value[-max_chars:]
+
+
+def _resolve_compile_target(source_root: Path, project_relpath: Optional[str]) -> Path:
+    if project_relpath and str(project_relpath).strip():
+        rel = str(project_relpath).strip().replace("\\", "/")
+        target = (source_root / rel).resolve()
+        try:
+            target.relative_to(source_root)
+        except Exception:
+            raise HTTPException(status_code=400, detail="project_relpath must stay inside source archive")
+        if not target.exists():
+            raise HTTPException(status_code=400, detail=f"project_relpath not found in archive: {project_relpath}")
+        return target
+
+    csproj = sorted([p for p in source_root.rglob("*.csproj") if p.is_file()], key=lambda p: len(str(p)))
+    if csproj:
+        return csproj[0]
+    cs_files = sorted([p for p in source_root.rglob("*.cs") if p.is_file()], key=lambda p: len(str(p)))
+    if cs_files:
+        return cs_files[0]
+    return source_root
+
+
+def _snapshot_algo_files(root: Path) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for path in root.rglob("*.algo"):
+        if path.is_file():
+            try:
+                out[str(path.resolve())] = float(path.stat().st_mtime)
+            except Exception:
+                continue
+    return out
+
+
+def _pick_compiled_algo(root: Path, before: dict[str, float], explicit_output: Path) -> Optional[Path]:
+    if explicit_output.exists() and explicit_output.is_file() and explicit_output.stat().st_size > 0:
+        return explicit_output
+
+    candidates: list[Path] = []
+    for path in root.rglob("*.algo"):
+        if not path.is_file():
+            continue
+        try:
+            mtime = float(path.stat().st_mtime)
+        except Exception:
+            continue
+        prev = before.get(str(path.resolve()))
+        if prev is None or mtime > prev:
+            candidates.append(path)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: float(p.stat().st_mtime), reverse=True)
+    return candidates[0]
+
+
+def _find_compiled_metadata_file(algo_path: Path) -> Optional[Path]:
+    resolved = Path(algo_path).resolve()
+    candidates: list[Path] = [Path(str(resolved) + ".metadata")]
+    if resolved.suffix.lower() == ".algo":
+        candidates.append(resolved.with_suffix(".algo.metadata"))
+    candidates.append(resolved.with_suffix(".metadata"))
+    candidates.append(resolved.parent / f"{resolved.stem}.algo.metadata")
+    candidates.append(resolved.parent / f"{resolved.stem}.metadata")
+
+    def _safe_mtime(path: Path) -> float:
+        try:
+            return float(path.stat().st_mtime)
+        except Exception:
+            return 0.0
+
+    same_dir_fallback = sorted(
+        [p for p in resolved.parent.glob("*.algo.metadata") if p.is_file()],
+        key=_safe_mtime,
+        reverse=True,
+    )
+    candidates.extend(same_dir_fallback)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            target = candidate.resolve()
+        except Exception:
+            continue
+        key = str(target)
+        if key in seen:
+            continue
+        seen.add(key)
+        if target.exists() and target.is_file():
+            return target
+    return None
+
+
+def _run_compile_commands(
+    target: Path,
+    output_path: Path,
+    timeout_seconds: int,
+    include_full_logs: bool = False,
+) -> tuple[Path, list[str], str, str]:
+    before = _snapshot_algo_files(output_path.parent)
+    cmd_prefix = _resolve_ctrade_cmd_prefix()
+    cmd_candidates: list[list[str]] = [
+        [*cmd_prefix, "compile", str(target), f"--output={output_path}"],
+        [*cmd_prefix, "compile", str(target), str(output_path)],
+        [*cmd_prefix, "compile", f"--source={target}", f"--output={output_path}"],
+    ]
+    logs: list[str] = []
+    last_stdout = ""
+    last_stderr = ""
+
+    for cmd in cmd_candidates:
+        try:
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=max(10, int(timeout_seconds)),
+            )
+        except FileNotFoundError:
+            raise HTTPException(status_code=500, detail=f"cTrader CLI not found: {CTRADE_BIN}")
+        except subprocess.TimeoutExpired:
+            logs.append(f"TIMEOUT: {' '.join(cmd)}")
+            continue
+        except Exception as exc:
+            logs.append(f"ERROR: {' '.join(cmd)} -> {exc}")
+            continue
+
+        last_stdout = res.stdout or ""
+        last_stderr = res.stderr or ""
+        if res.returncode == 0:
+            found = _pick_compiled_algo(output_path.parent, before, output_path)
+            if found:
+                return found, cmd, last_stdout, last_stderr
+        if include_full_logs:
+            logs.append(
+                f"RC={res.returncode}: {' '.join(cmd)}\n[stderr]\n{last_stderr}\n[stdout]\n{last_stdout}"
+            )
+        else:
+            logs.append(
+                f"RC={res.returncode}: {' '.join(cmd)} | stderr={_tail_text(last_stderr, 400)} | stdout={_tail_text(last_stdout, 400)}"
+            )
+
+    detail = "Compile failed on worker."
+    if logs:
+        detail += " " + " || ".join(logs[:3])
+    raise HTTPException(status_code=502, detail=detail)
 
 
 @app.middleware("http")
@@ -1344,6 +1519,79 @@ def _execute_pass_job(
         artifacts_zip_b64=artifacts_zip_b64,
         error=None if rep else "report_missing_or_invalid",
     )
+
+
+@app.post("/compile", response_model=CompileSourceResponse)
+def compile_source(payload: CompileSourceRequest):
+    with STATE_LOCK:
+        run = CURRENT_RUN
+    busy, _, _ = _is_busy(run)
+    if busy:
+        raise HTTPException(status_code=409, detail="Worker is busy")
+
+    source_zip_b64 = str(payload.source_zip_b64 or "").strip()
+    if not source_zip_b64:
+        raise HTTPException(status_code=400, detail="source_zip_b64 is required")
+    timeout_seconds = int(payload.timeout_seconds or 300)
+
+    compile_id = f"compile_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    workdir = (WORKER_ROOT / compile_id).resolve()
+    source_dir = (workdir / "source").resolve()
+    source_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        try:
+            zip_bytes = base64.b64decode(source_zip_b64.encode("ascii"))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid source_zip_b64 payload: {exc}")
+
+        zip_path = workdir / "source.zip"
+        zip_path.write_bytes(zip_bytes)
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(source_dir)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid source zip payload: {exc}")
+
+        target = _resolve_compile_target(source_dir, payload.project_relpath)
+        output_path = (workdir / "compiled.algo").resolve()
+        compiled_algo, used_cmd, stdout, stderr = _run_compile_commands(
+            target,
+            output_path,
+            timeout_seconds,
+            include_full_logs=bool(payload.include_full_logs),
+        )
+        algo_bytes = compiled_algo.read_bytes()
+        metadata_path = _find_compiled_metadata_file(compiled_algo)
+        metadata_bytes: Optional[bytes] = None
+        if metadata_path:
+            metadata_bytes = metadata_path.read_bytes()
+
+        _log_event(
+            "INFO",
+            f"compile ok target={target} output={compiled_algo}",
+            kind="compile",
+            extra={"compile_id": compile_id, "target": str(target), "output": str(compiled_algo)},
+        )
+
+        return CompileSourceResponse(
+            ok=True,
+            algo_b64=base64.b64encode(algo_bytes).decode("ascii"),
+            algo_name=compiled_algo.name,
+            compile_target=str(target),
+            command=used_cmd,
+            stdout_tail=_tail_text(stdout),
+            stderr_tail=_tail_text(stderr),
+            stdout_full=(stdout if bool(payload.include_full_logs) else None),
+            stderr_full=(stderr if bool(payload.include_full_logs) else None),
+            metadata_b64=(base64.b64encode(metadata_bytes).decode("ascii") if metadata_bytes is not None else None),
+            metadata_name=(metadata_path.name if metadata_path else None),
+            workdir=str(workdir),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"compile failed: {exc}")
 
 
 @app.get("/status", response_model=WorkerStatus)

@@ -1,0 +1,343 @@
+REVERSE ENGINEERED PLAYBOOK - cTrader CLI PATCH (FAST REBUILD)
+Repo: /Users/danielsaan/programmi/BravoOPTIMO_UI
+Obiettivo: rifare da zero la patch del CLI in modo rapido quando cTrader aggiorna.
+
+BRIEF (DA INCOLLARE A UN NUOVO AGENTE)
+BASE di partenza:
+- Immagine `ghcr.io/spotware/ctrader-console:latest`
+- cTrader CLI (`ctrader-cli`) e DLL `cTrader.Console.Infrastructure.dll`
+
+Obiettivo:
+- Sul `ctrader-console` abilitare esecuzione batch parallela senza chiudere il processo host dopo ogni step.
+- Il terminale/processo deve restare in ascolto per il prossimo job backtest.
+- Comportamento target: simulare la UI cTrader quando lancia step multipli (sessione viva + rilancio job), ma lato CLI.
+- Risultato atteso: throughput migliore in batch (meno warm-up, meno overhead di restart processo).
+
+====================================================================
+0) RISULTATO FINALE CHE VOGLIAMO
+====================================================================
+- Session host persistente per slot worker (non one-shot per job).
+- Ogni slot tiene vivo 1 processo host e processa piu job consecutivi.
+- Nessun "stale cache" dei parametri tra job.
+- Stato CLI non va in shutdown dopo ogni backtest.
+
+In pratica:
+1) Patch host custom: /backend/worker/cli_patched_host/Program.cs
+2) Patch IL DLL: /backend/worker/cli_il_patcher/Program.cs
+3) Build image con patch applicata in Dockerfile.ctrader
+
+====================================================================
+1) ROOT CAUSE CHE CI HA BLOCCATO (LEZIONE CHIAVE)
+====================================================================
+Senza patch completa succedeva:
+- Job 1 ok.
+- Job 2/3 anche "ok=true" ma report scritti ancora sul path del job1.
+
+Causa reale:
+- Cache Single-instance nel DLL CLI decompilato:
+  A) CurrentCommandParametersProvider._parameters
+  B) CommandParametersBuilderBase._consoleCommandParameters
+
+Quindi anche cambiando argv runtime, parte della command graph usava ancora
+oggetti parametri del primo comando.
+
+====================================================================
+2) TARGET DI PATCH MINIMI (SEMPRE PARTIRE DA QUI)
+====================================================================
+DLL: cTrader.Console.Infrastructure.dll
+
+Patch #1:
+- Type: cTrader.Console.Infrastructure.StateMachine.Strategies.RobotDisposingStateStrategy
+- Method: DoEnter()
+- Nuovo comportamento: solo DisposeInstance(); RET;
+- Perche: evitare transizione automatica che spegne il loop sessione.
+
+Patch #2:
+- Type: cTrader.Console.Infrastructure.Application.Services.CurrentCommandParametersProvider
+- Method: get_Parameters()
+- Nuovo comportamento: ricostruire SEMPRE parametri dal builder e riscrivere _parameters.
+- Perche: niente cache stale tra comando N e N+1.
+
+Patch #3:
+- Type: cTrader.Console.Infrastructure.Application.CommandLine.Builders.CommandParametersBuilderBase
+- Method: Build()
+- Nuovo comportamento: return DoBuild(); (sempre)
+- Perche: disabilitare cache interna del builder del primo comando.
+
+====================================================================
+3) COME TROVARE I PUNTI GIUSTI IN UNA NUOVA VERSIONE
+====================================================================
+A) Decompila il DLL CLI con ilspycmd (roll-forward se runtime mismatch):
+   DOTNET_ROLL_FORWARD=Major ~/.dotnet/tools/ilspycmd -p -o /tmp/ctrader_infra_src <path>/cTrader.Console.Infrastructure.dll
+
+B) Cerca pattern cache:
+   rg -n "_parameters|_consoleCommandParameters|\\?\\? \\(_.*=|if \\(_.* != null\\)" /tmp/ctrader_infra_src -g '*.cs'
+
+C) Verifica classi target:
+   - CurrentCommandParametersProvider.cs
+   - CommandParametersBuilderBase.cs
+   - RobotDisposingStateStrategy.cs
+
+D) Se nomi cambiano:
+   - Cerca "Build()" nella gerarchia command builders.
+   - Cerca provider che espone "Parameters" e usa cache lazy.
+   - Cerca stato "RobotDisposing" o equivalente pre-shutdown.
+
+====================================================================
+4) HOST PERSISTENTE - LOGICA MINIMA OBBLIGATORIA
+====================================================================
+Nel host custom (Program.cs) va mantenuto:
+
+1) Bootstrap una volta:
+   - ConsoleBootstrapper.Run()
+   - recupera container Autofac.
+   - risolve IConsoleApplicationLoop, transition, state machine, state context.
+
+2) Init ambiente corretto:
+   - __CT_PRODUCT_PATH = cliDir
+   - __CT_DOTNET_PATH = RuntimeEnvironment.GetRuntimeDirectory()
+   - call EnvironmentInitializationService.LauncherInitialize()
+
+3) Init sync context prima del loop:
+   - resolve ISynchronizationContextInitializer
+   - Initialize()
+   - poi Run() del loop su thread dedicato.
+
+4) Per comando successivo:
+   - aggiorna Environment.s_commandLineArgs
+   - reset state context (ErrorCode=0, UnhandledException=null)
+   - transition MoveTo(ApplicationLoopStarted)
+
+5) Rilevazione fine job:
+   - polling stato fino a RobotDisposing dopo stato non-idle.
+   - se ApplicationShutdown => fatal.
+   - se UnhandledException valorizzata => fatal.
+
+====================================================================
+5) TEST RAPIDO (DA FARE SEMPRE, 10-15 MIN)
+====================================================================
+Test 1 - 3 job validi sequenziali:
+- stesso host process, 3 richieste JSONL.
+- atteso: 3 risposte ok=true exitCode=0
+- atteso: report diversi in seq1/seq2/seq3 (non solo seq1).
+
+Test 2 - valid/invalid/valid:
+- job2 con symbol invalido.
+- atteso: job1 ok, job2 fail, job3 ok.
+- questo dimostra refresh reale parametri tra comandi.
+
+Comando test (pattern):
+- docker run --rm -i --entrypoint dotnet ... bravooptimo-worker-ctrader:local /app/worker/cli_patched_host/Optimo.CliPatchedHost.dll --cli-dir /app
+- input: righe JSON {"id":"1","args":[...]}
+
+====================================================================
+6) CHECKLIST DIAGNOSTICA (SE FALLISCE)
+====================================================================
+Sintomo: "Value for parameter start can't be parsed"
+- Non e patch bug. Formato data non compatibile.
+- Usa formato CLI atteso (es: "01/01/2026 00:00").
+
+Sintomo: job2/job3 ok ma report solo seq1
+- Patch #2 o #3 non applicata (cache ancora attiva).
+- Controlla output patcher in docker build.
+
+Sintomo: NRE in startup robot
+- host non ha init ambiente/sync context corretti.
+- ricontrolla __CT_DOTNET_PATH + LauncherInitialize + Initialize().
+
+Sintomo: host termina dopo primo job
+- patch RobotDisposing non applicata o host entra in shutdown path.
+
+====================================================================
+7) PIPELINE DI RIPATCH DOPO UPDATE cTrader (PROCEDURA OPERATIVA)
+====================================================================
+1) Aggiorna base image cTrader.
+2) Build image locale e leggi output patcher.
+3) Se patcher fallisce per signature mismatch:
+   - decompila nuova DLL.
+   - aggiorna nomi/type target nel patcher.
+   - riadatta IL body (3 patch sopra).
+4) Rebuild.
+5) Esegui test rapidi Test1 + Test2.
+6) Solo poi integra in run reali.
+
+====================================================================
+8) COMANDI PRONTI (COPIA/INCOLLA)
+====================================================================
+Build patcher:
+dotnet build /Users/danielsaan/programmi/BravoOPTIMO_UI/backend/worker/cli_il_patcher/Optimo.CliIlPatcher.csproj -c Release
+
+Build host:
+dotnet build /Users/danielsaan/programmi/BravoOPTIMO_UI/backend/worker/cli_patched_host/Optimo.CliPatchedHost.csproj -c Release
+
+Build image:
+docker build -f /Users/danielsaan/programmi/BravoOPTIMO_UI/backend/worker/Dockerfile.ctrader -t bravooptimo-worker-ctrader:local /Users/danielsaan/programmi/BravoOPTIMO_UI/backend
+
+Controllo patch applicate in build log (attese):
+- RobotDisposingStateStrategy.DoEnter => DisposeInstance(); ...
+- CurrentCommandParametersProvider.get_Parameters => always rebuild ...
+- CommandParametersBuilderBase.Build => always call DoBuild() ...
+
+====================================================================
+9) FILE CHIAVE DA TENERE SOTTO CONTROLLO
+====================================================================
+- /Users/danielsaan/programmi/BravoOPTIMO_UI/backend/worker/cli_il_patcher/Program.cs
+- /Users/danielsaan/programmi/BravoOPTIMO_UI/backend/worker/cli_patched_host/Program.cs
+- /Users/danielsaan/programmi/BravoOPTIMO_UI/backend/worker/Dockerfile.ctrader
+- /Users/danielsaan/programmi/BravoOPTIMO_UI/backend/worker/main.py
+
+====================================================================
+10) STIMA TEMPI REALE (SEGUI QUESTO PLAYBOOK)
+====================================================================
+Se cTrader update NON rompe firme tipi/metodi:
+- 15-30 minuti end-to-end.
+
+Se rompe firme target:
+- 45-90 minuti (decompile + re-map target + test).
+
+Senza questo playbook:
+- facile perdere 2+ ore su falsi indizi.
+
+====================================================================
+11) INVARIANTI DA NON ROMPERE (SE ROMPI QUESTI, SI TORNA AI BUG)
+====================================================================
+Invariant #1:
+- Ogni worker slot deve avere 1 _PatchedCliClient persistente.
+- Non creare/chiudere host per ogni pass.
+
+Invariant #2:
+- Dopo ogni job completato, stato deve tornare a RobotDisposing idle.
+- Il prossimo job parte solo con MoveTo(ApplicationLoopStarted) esplicito dal host.
+
+Invariant #3:
+- Ogni comando deve ricalcolare i command parameters (no cache del primo comando).
+- Se manca, i report/path/parametri restano "incollati" al job1.
+
+Invariant #4:
+- In caso timeout/stop/fatal: reset solo dello slot coinvolto, non di tutto il run.
+
+====================================================================
+12) GOTCHA PRATICI (QUESTI FANNO PERDERE TEMPO)
+====================================================================
+- Dentro image, entrypoint default e uvicorn: per test host diretto usare sempre
+  `docker run ... --entrypoint dotnet ... /app/worker/cli_patched_host/Optimo.CliPatchedHost.dll --cli-dir /app`
+- Date CLI: se formato non compatibile -> errore parser e falso allarme patch.
+- Apple Silicon + image amd64: warning piattaforma atteso, non e la causa del bug logico.
+- ilspycmd runtime mismatch locale: usare `DOTNET_ROLL_FORWARD=Major`.
+- Non confondere "ok=true" con risultato reale: verificare sempre file report per ogni seq.
+
+====================================================================
+13) COME PROVARE CHE LA SESSIONE E DAVVERO PERSISTENTE
+====================================================================
+Checklist oggettiva:
+1) Nel log del pass appare `[execution] patched_cli_host pid=<N>`.
+2) Su pass consecutivi dello stesso slot il PID resta uguale.
+3) Il pass 1 tende a essere piu lento (warm-up), pass successivi piu veloci.
+4) Esistono report distinti in cartelle diverse (seq1/seq2/seq3).
+
+Se 1-2-3-4 sono veri, la sessione persistente sta funzionando.
+
+====================================================================
+14) ROLLBACK RAPIDO SE PATCH NUOVA ROMPE
+====================================================================
+- Il patcher crea backup timestampati:
+  `/app/cTrader.Console.Infrastructure.dll.bak_<UTCSTAMP>`
+- Se patch rotta:
+  1) ripristina DLL da backup;
+  2) rebuild image;
+  3) conferma che fallback one-shot funziona;
+  4) rientra sui target patch con decompile.
+
+====================================================================
+15) MAPPATURA PARALLELISMO WORKER (PER CAPACITA CLUSTER)
+====================================================================
+Nel worker attuale:
+- `MAX_PARALLEL = OPTIMO_WORKER_PARALLEL` (default auto cTrader-like: floor(cpu/2)+1)
+- ogni slot = 1 loop `_process_loop` + 1 `_PatchedCliClient` persistente.
+- quindi su macchina 8 core default: 5 slot ~ 5 job paralleli.
+
+Esempio cluster:
+- 4 macchine x 8 core -> circa 5 slot ciascuna -> ~20 job paralleli totali.
+
+====================================================================
+16) MINI RUNBOOK "0 CONTESTO" (SE ARRIVA NUOVO AGENTE)
+====================================================================
+1) Apri questi file:
+   - backend/worker_ignora_unoffical/cli_il_patcher/Program.cs
+   - backend/worker_ignora_unoffical/cli_patched_host/Program.cs
+   - backend/worker_ignora_unoffical/Dockerfile.ctrader.patched
+2) Build image locale.
+3) Controlla log patcher: devono comparire le 3 patch (RobotDisposing + CurrentCommandParametersProvider + CommandParametersBuilderBase).
+4) Esegui test 3 job sequenziali.
+5) Esegui test valid/invalid/valid.
+6) Conferma file report in tutte le cartelle attese.
+7) Solo dopo promuovi su run reale.
+
+====================================================================
+17) DIFFICOLTA REALI INCONTRATE (STORICO)
+====================================================================
+Questi sono i problemi che hanno fatto perdere piu tempo prima del fix finale.
+Se ricapitano, andare dritti alla causa indicata:
+
+1) Falso positivo "file/mount mancante"
+- Sintomo: crash host patched durante backtest.
+- Causa reale: lifecycle interno CLI non inizializzato correttamente (non mount).
+
+2) Formato data CLI non compatibile
+- Sintomo: `Value for parameter start can't be parsed`.
+- Errore comune: inviare date ISO (`2025-10-01T...`) nel test rapido.
+- Fix: usare formato accettato dal CLI (es. `01/10/2025 00:00`).
+
+3) Test container eseguito con entrypoint sbagliato
+- Sintomo: errore opzioni uvicorn (`--cli-dir` unknown).
+- Causa: image worker ha ENTRYPOINT uvicorn.
+- Fix: nei test host usare sempre `--entrypoint dotnet`.
+
+4) Init runtime incompleto nel host patched
+- Sintomo: crash/NRE in creazione cBot o behavior incoerente.
+- Fix obbligatori: `__CT_DOTNET_PATH`, `LauncherInitialize()`, `ISynchronizationContextInitializer.Initialize()`.
+
+5) Patch RobotDisposing da sola NON basta
+- Sintomo: job2/job3 rispondono `ok=true` ma output resta su seq1.
+- Causa: cache comandi del primo job ancora attiva.
+- Fix: patch anche `CurrentCommandParametersProvider` + `CommandParametersBuilderBase`.
+
+6) Cache doppia nascosta (il punto piu importante)
+- A) `CurrentCommandParametersProvider._parameters`
+- B) `CommandParametersBuilderBase._consoleCommandParameters`
+- Finche non disabilitate entrambe, la sessione non e affidabile.
+
+7) Mismatch nomi tipo durante patch IL
+- Sintomo: patcher logga "required interface types not found".
+- Causa: namespace/interface name diverso da ipotesi iniziale.
+- Esempio reale: `IConsoleCommandParameters` e in namespace `...CommandLine.Builders`.
+
+8) Test locale patcher fuori app-dir incompleto
+- Sintomo: `AssemblyResolutionException` (dipendenze non risolte).
+- Causa: copiare solo la DLL target senza dipendenze accanto.
+- Fix: patchare nella cartella completa `/app` (o replica completa DLL set).
+
+9) Rumore diagnostico piattaforma (amd64 su arm64)
+- Sintomo: warning piattaforma Docker su Apple Silicon.
+- Impatto: non blocca la logica della patch; e solo warning.
+
+10) Primo pass molto lento (warm-up), rischio timeout manuale
+- Sintomo: si pensa che host sia bloccato.
+- Causa: primo avvio cBot/backtesting stack.
+- Fix: attese coerenti; confrontare tempi pass 2/3.
+
+11) Verifica incompleta basata solo su `ok=true`
+- Errore: considerare "risolto" senza controllare artifacts.
+- Fix: validare SEMPRE presenza report in cartelle distinte.
+
+12) Bug critico Linux validator (TypeLoadException FluentValidation)
+- Sintomo: `Could not load type 'FluentValidation.AbstractValidator\`1'` in `LinuxFullAccessValidator..ctor`.
+- Causa: patch IL che invocava un base ctor con firma sbagliata.
+- Fix definitivo: in patcher creare `MethodReference` del ctor base direttamente da `targetType.BaseType`
+  e riscrivere il ctor a:
+  `ldarg.0`, `call instance void <BaseType>::.ctor()`, `ret`.
+- Nota: NON usare inferenza fragile da `Resolve().Methods` se cambia il metadata della base class.
+
+====================================================================
+FINE
+====================================================================
