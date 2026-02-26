@@ -1,0 +1,12 @@
+cTrader.Automate.TargetProcess.TargetProcessFactory
+cTrader.Automate.TargetProcess.TargetProcessBase
+cTrader.Automate.TargetProcess.NetCore.Unprotected.NetCoreUnprotectedProcess
+cTrader.Automate.TargetProcess.NetCore.Protected.NetCoreProtectedProcess
+cTrader.Automate.TargetProcess.Native.NativeProcessProvider
+cTrader.Automate.TargetProcess.Native.NativeProcessRegistry
+cTrader.Automate.BrokerProcess.NetCoreBrokerProcess
+cTrader.Automate.BrokerProcess.NetCoreBrokerProcessManager
+cTrader.Automate.BrokerProcess.AccumulativeNetCoreBrokerProcess
+cTrader.Automate.BrokerProcess.HostProcessParameters
+cTrader.Automate.Runtime.OutProc.OutProcRuntimeHost
+cTrader.Automate.Runtime.OutProc.OutProcSharedResources

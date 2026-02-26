@@ -1,0 +1,25 @@
+using System;
+using Core.Autofac.Extension;
+using cTrader.Console.Infrastructure.Application.CommandLine.Builders;
+using cTrader.Console.Infrastructure.Application.CommandLine.Validators;
+
+namespace cTrader.Console.Infrastructure.StateMachine.Strategies;
+
+[Export(InstanceKind.PerDependency, new Type[] { typeof(IConsoleApplicationLifecycleStateStrategy) })]
+internal class BacktestCommandFlagsValidatingStateStrategy : ConsoleStateStrategyWithFluentValidation
+{
+	private readonly IConsoleApplicationLifecycleStateTransition _consoleApplicationLifecycleStateTransition;
+
+	public override ConsoleApplicationLifecycleState State => ConsoleApplicationLifecycleState.BacktestCommandFlagsValidating;
+
+	public BacktestCommandFlagsValidatingStateStrategy(IConsoleCurrentCommandParametersValidatorProvider consoleCurrentCommandParametersValidatorProvider, IConsoleCurrentCommandParametersBuilderProvider consoleCurrentCommandParametersBuilderProvider, IConsoleApplicationLifecycleStateTransition consoleApplicationLifecycleStateTransition)
+		: base(consoleCurrentCommandParametersValidatorProvider, consoleCurrentCommandParametersBuilderProvider)
+	{
+		_consoleApplicationLifecycleStateTransition = consoleApplicationLifecycleStateTransition;
+	}
+
+	protected override void ValidationSucceeded()
+	{
+		_consoleApplicationLifecycleStateTransition.MoveTo(ConsoleApplicationLifecycleState.BacktestCommandParametersShowing);
+	}
+}

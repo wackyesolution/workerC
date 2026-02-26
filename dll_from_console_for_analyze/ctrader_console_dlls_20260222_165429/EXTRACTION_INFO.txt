@@ -1,0 +1,3 @@
+source_image=ghcr.io/spotware/ctrader-console:latest
+extracted_at=2026-02-22T15:54:39Z
+dll_count=160
