@@ -187,6 +187,7 @@ CLI_PATCHED_CLI_DIR = str(os.environ.get("CTRADE_CLI_DIR", _guess_ctrade_cli_dir
 CALLBACK_BATCH_SIZE = max(1, _int_env("OPTIMO_WORKER_CALLBACK_BATCH_SIZE", 10))
 CALLBACK_BATCH_FLUSH_SECONDS = max(0.1, _float_env("OPTIMO_WORKER_CALLBACK_BATCH_FLUSH_SECONDS", 1.0))
 CALLBACK_POST_TIMEOUT_SECONDS = max(3, _int_env("OPTIMO_WORKER_CALLBACK_TIMEOUT_SECONDS", 10))
+SLOW_PASS_LOG_SECONDS = max(1.0, _float_env("OPTIMO_WORKER_SLOW_PASS_LOG_SECONDS", 180.0))
 
 
 def now_utc_iso() -> str:
@@ -195,6 +196,15 @@ def now_utc_iso() -> str:
 
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
+
+def _as_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
 
 
 def write_events(path: Path) -> None:
@@ -739,6 +749,7 @@ class _PatchedCliClient:
 def _create_patched_cli_client(run: "_RunState", worker_index: int) -> _PatchedCliClient:
     if not Path(CLI_PATCHED_HOST_PATH).exists():
         raise RuntimeError(f"patched CLI host not found at {CLI_PATCHED_HOST_PATH}")
+    started_perf = time.perf_counter()
     try:
         client = _PatchedCliClient(
             worker_index,
@@ -747,12 +758,19 @@ def _create_patched_cli_client(run: "_RunState", worker_index: int) -> _PatchedC
         )
     except Exception as exc:
         raise RuntimeError(f"failed to start patched CLI host for slot {worker_index}: {exc}") from exc
+    startup_seconds = round(max(0.0, time.perf_counter() - started_perf), 3)
 
     _log_event(
         "INFO",
-        f"patched CLI host started for slot {worker_index} (pid={client.pid})",
+        f"patched CLI host started for slot {worker_index} (pid={client.pid}, startup_seconds={startup_seconds})",
         kind="run",
-        extra={"run_id": run.run_id, "worker_slot": worker_index, "phase": "patched_cli_started", "pid": client.pid},
+        extra={
+            "run_id": run.run_id,
+            "worker_slot": worker_index,
+            "phase": "patched_cli_started",
+            "pid": client.pid,
+            "startup_seconds": startup_seconds,
+        },
     )
     return client
 
@@ -775,6 +793,9 @@ def run_backtest_with_patched_cli(
     timeout_seconds: int,
     balance: float | None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    run_id: Optional[str] = None,
+    pass_id: Optional[int] = None,
+    worker_slot: Optional[int] = None,
 ) -> bool:
     args = [
         "backtest",
@@ -799,6 +820,8 @@ def run_backtest_with_patched_cli(
     done = threading.Event()
     result_box: dict[str, Any] = {}
     error_box: dict[str, Exception] = {}
+    patched_host_elapsed_ms: float | None = None
+    patched_host_elapsed_seconds: float | None = None
 
     def reports_ready() -> bool:
         return (
@@ -858,6 +881,12 @@ def run_backtest_with_patched_cli(
                 if raw_exit_code is None:
                     raw_exit_code = 1
                 exit_code = int(raw_exit_code)
+                raw_elapsed_ms = response.get("elapsed_ms")
+                if raw_elapsed_ms is None:
+                    raw_elapsed_ms = response.get("elapsedMs")
+                patched_host_elapsed_ms = _as_float_or_none(raw_elapsed_ms)
+                if patched_host_elapsed_ms is not None:
+                    patched_host_elapsed_seconds = round(max(0.0, patched_host_elapsed_ms / 1000.0), 3)
                 stdout = str(response.get("stdout") or "")
                 stderr = str(response.get("stderr") or "")
                 if stdout:
@@ -878,10 +907,36 @@ def run_backtest_with_patched_cli(
 
         worker_thread.join(timeout=2.0)
         elapsed_total = round(max(0.0, time.time() - start_ts), 3)
+        if patched_host_elapsed_ms is not None:
+            logf.write(f"[patched_host_elapsed_ms] {patched_host_elapsed_ms}\n")
         logf.write(f"\n[finished_at_utc] {now_utc_iso()}\n")
         logf.write(f"[elapsed_seconds_total] {elapsed_total}\n")
         logf.write(f"[outcome] {outcome}\n")
         logf.flush()
+
+    if run_id:
+        level = "INFO" if success else "WARNING"
+        extra: dict[str, Any] = {
+            "run_id": run_id,
+            "phase": "patched_cli_backtest",
+            "outcome": outcome,
+            "elapsed_seconds_total": elapsed_total,
+        }
+        if pass_id is not None:
+            extra["pass_id"] = int(pass_id)
+        if worker_slot is not None:
+            extra["worker_slot"] = int(worker_slot)
+        if patched_host_elapsed_seconds is not None:
+            extra["patched_host_elapsed_seconds"] = patched_host_elapsed_seconds
+        _log_event(
+            level,
+            (
+                f"patched-cli backtest outcome={outcome} elapsed_total_seconds={elapsed_total} "
+                f"host_elapsed_seconds={patched_host_elapsed_seconds if patched_host_elapsed_seconds is not None else 'n/a'}"
+            ),
+            kind="run",
+            extra=extra,
+        )
 
     return success or reports_ready()
 
@@ -1645,6 +1700,7 @@ def _execute_pass_job(
     worker_index: int,
     cli_client: _PatchedCliClient | None = None,
 ) -> PassResult:
+    prep_started_perf = time.perf_counter()
     pass_dir = run.workdir / str(job.pass_id)
     ensure_dir(pass_dir)
 
@@ -1656,6 +1712,9 @@ def _execute_pass_job(
 
     write_events(events_path)
     write_cbotset(cbotset_path, job.parameters, run.config.symbol, run.config.period)
+    prep_elapsed_seconds = round(max(0.0, time.perf_counter() - prep_started_perf), 3)
+
+    backtest_started_perf = time.perf_counter()
     if cli_client is not None:
         ok = run_backtest_with_patched_cli(
             cli_client=cli_client,
@@ -1675,6 +1734,9 @@ def _execute_pass_job(
             timeout_seconds=int(run.config.timeout_seconds),
             balance=run.config.balance,
             stop_requested=run.stop.is_set,
+            run_id=run.run_id,
+            pass_id=job.pass_id,
+            worker_slot=worker_index,
         )
     else:
         ok = run_backtest(
@@ -1697,13 +1759,42 @@ def _execute_pass_job(
             on_proc_start=lambda proc: _track_run_proc_start(run, proc),
             on_proc_end=lambda pid: _track_run_proc_end(run, pid),
         )
+    backtest_elapsed_seconds = round(max(0.0, time.perf_counter() - backtest_started_perf), 3)
+
+    report_parse_started_perf = time.perf_counter()
     rep = parse_report(report_json) if ok else None
+    report_parse_elapsed_seconds = round(max(0.0, time.perf_counter() - report_parse_started_perf), 3)
     metrics = rep or {}
 
     artifacts_zip_b64 = None
     callback_batch_enabled = bool(run.config.callback_url) and CALLBACK_BATCH_SIZE > 1
+    zip_elapsed_seconds = 0.0
     if run.config.include_artifacts and not callback_batch_enabled:
+        zip_started_perf = time.perf_counter()
         artifacts_zip_b64 = zip_dir_to_b64(pass_dir)
+        zip_elapsed_seconds = round(max(0.0, time.perf_counter() - zip_started_perf), 3)
+
+    if (not ok) or (backtest_elapsed_seconds >= SLOW_PASS_LOG_SECONDS):
+        _log_event(
+            "WARNING" if not ok else "INFO",
+            (
+                f"pass {job.pass_id} stage_timing prep={prep_elapsed_seconds}s "
+                f"backtest={backtest_elapsed_seconds}s parse={report_parse_elapsed_seconds}s zip={zip_elapsed_seconds}s"
+            ),
+            kind="run",
+            extra={
+                "run_id": run.run_id,
+                "pass_id": job.pass_id,
+                "worker_slot": worker_index,
+                "phase": "pass_stage_timing",
+                "ok": bool(ok),
+                "prep_seconds": prep_elapsed_seconds,
+                "backtest_seconds": backtest_elapsed_seconds,
+                "parse_report_seconds": report_parse_elapsed_seconds,
+                "zip_seconds": zip_elapsed_seconds,
+                "slow_threshold_seconds": SLOW_PASS_LOG_SECONDS,
+            },
+        )
 
     return PassResult(
         run_id=run.run_id,
