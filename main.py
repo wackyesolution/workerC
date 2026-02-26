@@ -33,6 +33,7 @@ CTRADE_BIN = os.environ.get(
 WORKER_ROOT = Path(os.environ.get("OPTIMO_WORKER_ROOT", "./data/worker_runs")).expanduser().resolve()
 WORKER_ROOT.mkdir(parents=True, exist_ok=True)
 
+
 def _auto_parallel_default() -> int:
     try:
         return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
@@ -101,12 +102,82 @@ def _guess_ctrade_cli_dir(cli_bin: str) -> str:
     return "/app"
 
 
-AUTO_PARALLEL_BASE = max(1, _auto_parallel_default())
-AUTO_PARALLEL_CTRADER = _ctrader_like_parallel_default(AUTO_PARALLEL_BASE)
-# Keep OPTIMO_WORKER_PARALLEL_PER_CORE for custom scaling; default is 1 to
-# preserve cTrader-like auto settings out of the box.
+def _clamp_worker_cpu_target_percent(raw: Any, default: int = 65) -> int:
+    try:
+        value = int(raw)
+    except Exception:
+        value = int(default)
+    return max(65, min(95, value))
+
+
+def _explicit_parallel_env() -> Optional[int]:
+    raw = str(os.environ.get("OPTIMO_WORKER_PARALLEL") or "").strip().lower()
+    if not raw or raw == "auto":
+        return None
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return None
+
+
+def _parallel_from_target(cpu_cores: int, cpu_target_percent: int) -> int:
+    cores = max(1, int(cpu_cores or 1))
+    base = _ctrader_like_parallel_default(cores)
+    top = max(base, int(cores * 0.95))
+    pct = _clamp_worker_cpu_target_percent(cpu_target_percent)
+    if pct <= 65 or top <= base:
+        return base
+    ratio = (pct - 65) / 30.0
+    slots = int(round(base + (top - base) * ratio))
+    return max(1, min(cores, slots))
+
+
+def _resolve_max_parallel(
+    *,
+    cpu_cores: int,
+    cpu_target_percent: int,
+    parallel_per_core: int,
+    explicit_parallel: Optional[int],
+) -> int:
+    if explicit_parallel is not None:
+        return max(1, int(explicit_parallel))
+    auto_slots = _parallel_from_target(cpu_cores, cpu_target_percent)
+    scale = max(1, int(parallel_per_core or 1))
+    return max(1, int(auto_slots) * scale)
+
+
+CPU_CORES = max(1, _auto_parallel_default())
+EXPLICIT_PARALLEL = _explicit_parallel_env()
+CPU_TARGET_PERCENT = _clamp_worker_cpu_target_percent(os.environ.get("OPTIMO_WORKER_CPU_TARGET_PERCENT", 65))
+# Keep OPTIMO_WORKER_PARALLEL_PER_CORE for custom scaling; default is 1.
 PARALLEL_PER_CORE = max(1, _int_env("OPTIMO_WORKER_PARALLEL_PER_CORE", 1))
-MAX_PARALLEL = max(1, _int_env("OPTIMO_WORKER_PARALLEL", AUTO_PARALLEL_CTRADER * PARALLEL_PER_CORE))
+MAX_PARALLEL = _resolve_max_parallel(
+    cpu_cores=CPU_CORES,
+    cpu_target_percent=CPU_TARGET_PERCENT,
+    parallel_per_core=PARALLEL_PER_CORE,
+    explicit_parallel=EXPLICIT_PARALLEL,
+)
+
+
+def _apply_parallel_policy(
+    *,
+    cpu_target_percent: Optional[int] = None,
+    parallel_per_core: Optional[int] = None,
+) -> int:
+    global CPU_TARGET_PERCENT, PARALLEL_PER_CORE, MAX_PARALLEL
+    if cpu_target_percent is not None:
+        CPU_TARGET_PERCENT = _clamp_worker_cpu_target_percent(cpu_target_percent)
+    if parallel_per_core is not None:
+        PARALLEL_PER_CORE = max(1, int(parallel_per_core))
+    MAX_PARALLEL = _resolve_max_parallel(
+        cpu_cores=CPU_CORES,
+        cpu_target_percent=CPU_TARGET_PERCENT,
+        parallel_per_core=PARALLEL_PER_CORE,
+        explicit_parallel=EXPLICIT_PARALLEL,
+    )
+    return MAX_PARALLEL
+
+
 CUSTOM_CLI_PATCHED = _bool_env("OPTIMO_CUSTOM_CLI_PATCHED", True)
 CLI_PATCHED_DOTNET_PATH = str(os.environ.get("OPTIMO_CLI_PATCHED_DOTNET_PATH", "dotnet")).strip() or "dotnet"
 CLI_PATCHED_HOST_PATH = str(
@@ -851,8 +922,16 @@ class WorkerStatus(BaseModel):
     running: int
     max_parallel: int
     cpu_cores: int
+    cpu_target_percent: int
+    parallel_per_core: int
+    explicit_parallel: Optional[int] = None
     current_run_id: Optional[str] = None
     started_at_utc: str
+
+
+class ParallelSettingsUpdate(BaseModel):
+    cpu_target_percent: Optional[int] = Field(default=None, ge=65, le=95)
+    parallel_per_core: Optional[int] = Field(default=None, ge=1, le=16)
 
 
 class RunStartRequest(BaseModel):
@@ -1219,12 +1298,18 @@ async def _announce_online_startup() -> None:
     cli_mode = "custom_patched" if CUSTOM_CLI_PATCHED else "default_subprocess"
     _log_event(
         "INFO",
-        f"Worker server running at {host}:{port} (max_parallel={MAX_PARALLEL}, cli_mode={cli_mode})",
+        (
+            f"Worker server running at {host}:{port} "
+            f"(max_parallel={MAX_PARALLEL}, target={CPU_TARGET_PERCENT}%, cli_mode={cli_mode})"
+        ),
         kind="startup",
         extra={
             "host": host,
             "port": port,
             "max_parallel": MAX_PARALLEL,
+            "cpu_target_percent": CPU_TARGET_PERCENT,
+            "parallel_per_core": PARALLEL_PER_CORE,
+            "explicit_parallel": EXPLICIT_PARALLEL,
             "cli_mode": cli_mode,
             "custom_cli_patched": CUSTOM_CLI_PATCHED,
             "cli_patched_host_path": CLI_PATCHED_HOST_PATH,
@@ -1264,7 +1349,10 @@ async def _announce_online_startup() -> None:
         [
             "Sono online!",
             public_url or "(public url unknown)",
-            f"max_parallel={MAX_PARALLEL} cpu_cores={_auto_parallel_default()}",
+            (
+                f"max_parallel={MAX_PARALLEL} cpu_cores={CPU_CORES} "
+                f"target={CPU_TARGET_PERCENT}% per_core={PARALLEL_PER_CORE}"
+            ),
         ]
     )
     for attempt in range(1, 6):
@@ -1712,10 +1800,54 @@ def status():
         queued=queued,
         running=running,
         max_parallel=MAX_PARALLEL,
-        cpu_cores=_auto_parallel_default(),
+        cpu_cores=CPU_CORES,
+        cpu_target_percent=CPU_TARGET_PERCENT,
+        parallel_per_core=PARALLEL_PER_CORE,
+        explicit_parallel=EXPLICIT_PARALLEL,
         current_run_id=run.run_id if run else None,
         started_at_utc=APP_STARTED_AT,
     )
+
+
+@app.put("/settings/parallel")
+@app.put("/api/settings/parallel")
+def update_parallel_settings(payload: ParallelSettingsUpdate):
+    with STATE_LOCK:
+        run = CURRENT_RUN
+    busy, queued, running = _is_busy(run)
+    next_parallel = _apply_parallel_policy(
+        cpu_target_percent=payload.cpu_target_percent,
+        parallel_per_core=payload.parallel_per_core,
+    )
+    _log_event(
+        "INFO",
+        (
+            f"parallel settings updated: target={CPU_TARGET_PERCENT}% "
+            f"per_core={PARALLEL_PER_CORE} max_parallel={next_parallel}"
+        ),
+        kind="config",
+        extra={
+            "phase": "parallel_settings_update",
+            "cpu_target_percent": CPU_TARGET_PERCENT,
+            "parallel_per_core": PARALLEL_PER_CORE,
+            "explicit_parallel": EXPLICIT_PARALLEL,
+            "max_parallel": next_parallel,
+            "busy": busy,
+            "queued": queued,
+            "running": running,
+        },
+    )
+    return {
+        "ok": True,
+        "cpu_target_percent": CPU_TARGET_PERCENT,
+        "parallel_per_core": PARALLEL_PER_CORE,
+        "explicit_parallel": EXPLICIT_PARALLEL,
+        "max_parallel": next_parallel,
+        "applies_from_next_run": bool(busy),
+        "busy": busy,
+        "queued": queued,
+        "running": running,
+    }
 
 
 @app.post("/ctrader/accounts")
