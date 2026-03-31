@@ -1,4 +1,4 @@
-ARG CTRADER_CONSOLE_BASE_IMAGE=ghcr.io/spotware/ctrader-console:latest
+ARG CTRADER_CONSOLE_BASE_IMAGE=ghcr.io/spotware/ctrader-console@sha256:a0f0c22d5bbe31db8de6e91b6caad9b8061b52d9133426aa6242848469c208e9
 FROM ${CTRADER_CONSOLE_BASE_IMAGE}
 
 WORKDIR /app

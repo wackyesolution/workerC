@@ -16,7 +16,7 @@ RUN dotnet restore cli_il_patcher/Optimo.CliIlPatcher.csproj
 COPY cli_il_patcher/ cli_il_patcher/
 RUN dotnet publish cli_il_patcher/Optimo.CliIlPatcher.csproj -c Release -o /out --no-self-contained
 
-FROM ghcr.io/spotware/ctrader-console:latest
+FROM ghcr.io/spotware/ctrader-console@sha256:a0f0c22d5bbe31db8de6e91b6caad9b8061b52d9133426aa6242848469c208e9
 
 WORKDIR /app
 

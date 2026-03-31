@@ -1048,6 +1048,9 @@ class PassResult(BaseModel):
     metrics: dict[str, Any] = Field(default_factory=dict)
     artifacts_zip_b64: Optional[str] = None
     error: Optional[str] = None
+    outcome: Optional[str] = None
+    error_detail: Optional[str] = None
+    log_tail: Optional[str] = None
 
 
 class RunResultsResponse(BaseModel):
@@ -1168,6 +1171,70 @@ def _tail_text(text: str, max_chars: int = 4000) -> str:
     if len(value) <= max_chars:
         return value
     return value[-max_chars:]
+
+
+def _read_text_best_effort(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _extract_backtest_outcome(log_text: str) -> str | None:
+    for raw in reversed(str(log_text or "").splitlines()):
+        line = raw.strip()
+        if line.startswith("[outcome]"):
+            value = line[len("[outcome]") :].strip()
+            return value or None
+    return None
+
+
+def _extract_backtest_error_detail(log_text: str) -> str | None:
+    lines = [str(raw or "").strip() for raw in str(log_text or "").splitlines() if str(raw or "").strip()]
+    if not lines:
+        return None
+
+    for line in reversed(lines):
+        if line.startswith("[patched_host_error]"):
+            value = line[len("[patched_host_error]") :].strip()
+            if value:
+                return _tail_text(value, max_chars=1200)
+
+    error_markers = (
+        "InvalidOperationException:",
+        "TimeoutException:",
+        "cli_unhandled_exception:",
+        "session_backtest_error:",
+        "session_loop_error:",
+        "backtest_failed_error_code=",
+        "backtest_timeout_waiting_for_robot_disposing",
+        "Message expected",
+        "No historical data",
+    )
+    for line in reversed(lines):
+        if any(marker in line for marker in error_markers):
+            return _tail_text(line, max_chars=1200)
+
+    for line in reversed(lines):
+        if line.startswith("Error | "):
+            return _tail_text(line, max_chars=1200)
+
+    outcome = _extract_backtest_outcome(log_text)
+    if outcome:
+        return outcome
+
+    return _tail_text(lines[-1], max_chars=1200) or None
+
+
+def _collect_backtest_diagnostics(log_path: Path) -> dict[str, str | None]:
+    log_text = _read_text_best_effort(log_path)
+    if not log_text:
+        return {"log_tail": None, "outcome": None, "error_detail": None}
+    return {
+        "log_tail": _tail_text(log_text),
+        "outcome": _extract_backtest_outcome(log_text),
+        "error_detail": _extract_backtest_error_detail(log_text),
+    }
 
 
 def _resolve_compile_target(source_root: Path, project_relpath: Optional[str]) -> Path:
@@ -1579,6 +1646,9 @@ async def _process_loop(run: _RunState, worker_index: int) -> None:
                     metrics={},
                     artifacts_zip_b64=None,
                     error=str(exc),
+                    outcome="worker_exception",
+                    error_detail=str(exc),
+                    log_tail=None,
                 )
             elapsed_total = round(max(0.0, time.perf_counter() - started_perf), 3)
             result.started_at_utc = started_at
@@ -1765,6 +1835,7 @@ def _execute_pass_job(
     rep = parse_report(report_json) if ok else None
     report_parse_elapsed_seconds = round(max(0.0, time.perf_counter() - report_parse_started_perf), 3)
     metrics = rep or {}
+    diagnostics = _collect_backtest_diagnostics(log_path)
 
     artifacts_zip_b64 = None
     callback_batch_enabled = bool(run.config.callback_url) and CALLBACK_BATCH_SIZE > 1
@@ -1805,6 +1876,9 @@ def _execute_pass_job(
         metrics=metrics,
         artifacts_zip_b64=artifacts_zip_b64,
         error=None if rep else "report_missing_or_invalid",
+        outcome=None if rep else diagnostics.get("outcome"),
+        error_detail=None if rep else (diagnostics.get("error_detail") or "report_missing_or_invalid"),
+        log_tail=None if rep else diagnostics.get("log_tail"),
     )
 
 
