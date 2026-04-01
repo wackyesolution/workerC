@@ -1237,6 +1237,72 @@ def _collect_backtest_diagnostics(log_path: Path) -> dict[str, str | None]:
     }
 
 
+def _is_distributed_callback_url(callback_url: str | None) -> bool:
+    return "/api/distributed/callback/" in str(callback_url or "").strip()
+
+
+def _should_retry_ga_backtest_pass(
+    run: _RunState,
+    *,
+    ok: bool,
+    rep: dict[str, Any] | None,
+    diagnostics: dict[str, str | None],
+) -> bool:
+    if ok or rep:
+        return False
+    if run.stop.is_set():
+        return False
+    if str(run.config.data_mode or "").strip().lower() != "ticks":
+        return False
+    if not _is_distributed_callback_url(run.config.callback_url):
+        return False
+    outcome = str(diagnostics.get("outcome") or "").strip().lower()
+    detail = str(diagnostics.get("error_detail") or "")
+    return ("process_exited_rc_1" in outcome) and ("Message expected" in detail)
+
+
+def _clear_backtest_retry_outputs(*paths: Path) -> None:
+    for path in paths:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            continue
+
+
+def _snapshot_backtest_attempt_files(
+    pass_dir: Path,
+    attempt_name: str,
+    *paths: Path,
+) -> Path:
+    attempt_dir = pass_dir / str(attempt_name or "").strip()
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    for path in paths:
+        try:
+            if not path.exists() or not path.is_file():
+                continue
+            shutil.copy2(path, attempt_dir / path.name)
+        except Exception:
+            continue
+    return attempt_dir
+
+
+def _format_ga_double_failure_detail(
+    first_diag: dict[str, str | None],
+    second_diag: dict[str, str | None],
+) -> str:
+    parts: list[str] = []
+    first_outcome = str(first_diag.get("outcome") or "").strip()
+    first_detail = str(first_diag.get("error_detail") or "").strip()
+    second_outcome = str(second_diag.get("outcome") or "").strip()
+    second_detail = str(second_diag.get("error_detail") or "").strip()
+    first_text = first_detail or first_outcome or "report_missing_or_invalid"
+    second_text = second_detail or second_outcome or "report_missing_or_invalid"
+    parts.append(f"tentativo_1={first_text}")
+    parts.append(f"tentativo_2={second_text}")
+    return " | ".join(parts)
+
+
 def _resolve_compile_target(source_root: Path, project_relpath: Optional[str]) -> Path:
     if project_relpath and str(project_relpath).strip():
         rel = str(project_relpath).strip().replace("\\", "/")
@@ -1784,58 +1850,134 @@ def _execute_pass_job(
     write_cbotset(cbotset_path, job.parameters, run.config.symbol, run.config.period)
     prep_elapsed_seconds = round(max(0.0, time.perf_counter() - prep_started_perf), 3)
 
-    backtest_started_perf = time.perf_counter()
-    if cli_client is not None:
-        ok = run_backtest_with_patched_cli(
-            cli_client=cli_client,
-            algo_path=run.algo_path,
-            cbotset_path=cbotset_path,
-            start=run.config.start,
-            end=run.config.end,
-            data_mode=run.config.data_mode,
-            ctid=run.config.ctid,
-            pwd_file=run.pwd_path,
-            account=run.config.account,
-            symbol=run.config.symbol,
-            period=run.config.period,
-            report_html=report_html,
-            report_json=report_json,
-            log_path=log_path,
-            timeout_seconds=int(run.config.timeout_seconds),
-            balance=run.config.balance,
-            stop_requested=run.stop.is_set,
-            run_id=run.run_id,
-            pass_id=job.pass_id,
-            worker_slot=worker_index,
-        )
-    else:
-        ok = run_backtest(
-            algo_path=run.algo_path,
-            cbotset_path=cbotset_path,
-            start=run.config.start,
-            end=run.config.end,
-            data_mode=run.config.data_mode,
-            ctid=run.config.ctid,
-            pwd_file=run.pwd_path,
-            account=run.config.account,
-            symbol=run.config.symbol,
-            period=run.config.period,
-            report_html=report_html,
-            report_json=report_json,
-            log_path=log_path,
-            timeout_seconds=int(run.config.timeout_seconds),
-            balance=run.config.balance,
-            stop_requested=run.stop.is_set,
-            on_proc_start=lambda proc: _track_run_proc_start(run, proc),
-            on_proc_end=lambda pid: _track_run_proc_end(run, pid),
-        )
-    backtest_elapsed_seconds = round(max(0.0, time.perf_counter() - backtest_started_perf), 3)
+    def _run_backtest_attempt() -> tuple[bool, dict[str, Any] | None, dict[str, str | None], float, float]:
+        backtest_started_perf = time.perf_counter()
+        if cli_client is not None:
+            ok = run_backtest_with_patched_cli(
+                cli_client=cli_client,
+                algo_path=run.algo_path,
+                cbotset_path=cbotset_path,
+                start=run.config.start,
+                end=run.config.end,
+                data_mode=run.config.data_mode,
+                ctid=run.config.ctid,
+                pwd_file=run.pwd_path,
+                account=run.config.account,
+                symbol=run.config.symbol,
+                period=run.config.period,
+                report_html=report_html,
+                report_json=report_json,
+                log_path=log_path,
+                timeout_seconds=int(run.config.timeout_seconds),
+                balance=run.config.balance,
+                stop_requested=run.stop.is_set,
+                run_id=run.run_id,
+                pass_id=job.pass_id,
+                worker_slot=worker_index,
+            )
+        else:
+            ok = run_backtest(
+                algo_path=run.algo_path,
+                cbotset_path=cbotset_path,
+                start=run.config.start,
+                end=run.config.end,
+                data_mode=run.config.data_mode,
+                ctid=run.config.ctid,
+                pwd_file=run.pwd_path,
+                account=run.config.account,
+                symbol=run.config.symbol,
+                period=run.config.period,
+                report_html=report_html,
+                report_json=report_json,
+                log_path=log_path,
+                timeout_seconds=int(run.config.timeout_seconds),
+                balance=run.config.balance,
+                stop_requested=run.stop.is_set,
+                on_proc_start=lambda proc: _track_run_proc_start(run, proc),
+                on_proc_end=lambda pid: _track_run_proc_end(run, pid),
+            )
+        backtest_elapsed_seconds = round(max(0.0, time.perf_counter() - backtest_started_perf), 3)
 
-    report_parse_started_perf = time.perf_counter()
-    rep = parse_report(report_json) if ok else None
-    report_parse_elapsed_seconds = round(max(0.0, time.perf_counter() - report_parse_started_perf), 3)
+        report_parse_started_perf = time.perf_counter()
+        rep = parse_report(report_json) if ok else None
+        report_parse_elapsed_seconds = round(max(0.0, time.perf_counter() - report_parse_started_perf), 3)
+        diagnostics = _collect_backtest_diagnostics(log_path)
+        return ok, rep, diagnostics, backtest_elapsed_seconds, report_parse_elapsed_seconds
+
+    ok, rep, diagnostics, backtest_elapsed_seconds, report_parse_elapsed_seconds = _run_backtest_attempt()
+    attempt_count = 1
+    retry_wait_seconds = 0.0
+    first_failure_diagnostics: dict[str, str | None] | None = None
+
+    if _should_retry_ga_backtest_pass(run, ok=ok, rep=rep, diagnostics=diagnostics):
+        attempt_count = 2
+        first_failure_diagnostics = dict(diagnostics)
+        _snapshot_backtest_attempt_files(
+            pass_dir,
+            "attempt_1",
+            report_html,
+            report_json,
+            log_path,
+            events_path,
+            cbotset_path,
+        )
+        _log_event(
+            "WARNING",
+            (
+                f"pass {job.pass_id} failed with retryable GA signature; "
+                f"waiting 10s before same-slot retry (run_id={run.run_id}, worker_slot={worker_index})"
+            ),
+            kind="run",
+            extra={
+                "run_id": run.run_id,
+                "pass_id": job.pass_id,
+                "worker_slot": worker_index,
+                "phase": "ga_retry_wait",
+                "retry_wait_seconds": 10,
+            },
+        )
+        time.sleep(10)
+        retry_wait_seconds = 10.0
+        if run.stop.is_set():
+            attempt_count = 1
+            retry_wait_seconds = 0.0
+            first_failure_diagnostics = None
+        else:
+            _clear_backtest_retry_outputs(report_html, report_json, log_path)
+            ok_retry, rep_retry, diagnostics_retry, retry_backtest_seconds, retry_parse_seconds = _run_backtest_attempt()
+            ok = ok_retry
+            rep = rep_retry
+            diagnostics = diagnostics_retry
+            backtest_elapsed_seconds = round(backtest_elapsed_seconds + retry_wait_seconds + retry_backtest_seconds, 3)
+            report_parse_elapsed_seconds = round(report_parse_elapsed_seconds + retry_parse_seconds, 3)
+            _log_event(
+                "INFO" if rep else "WARNING",
+                (
+                    f"pass {job.pass_id} same-slot GA retry finished "
+                    f"status={'Completed' if rep else 'Failed'} attempts={attempt_count} "
+                    f"(run_id={run.run_id}, worker_slot={worker_index})"
+                ),
+                kind="run",
+                extra={
+                    "run_id": run.run_id,
+                    "pass_id": job.pass_id,
+                    "worker_slot": worker_index,
+                    "phase": "ga_retry_finished",
+                    "attempts": attempt_count,
+                    "status": "Completed" if rep else "Failed",
+                },
+            )
+            _snapshot_backtest_attempt_files(
+                pass_dir,
+                "attempt_2",
+                report_html,
+                report_json,
+                log_path,
+                events_path,
+                cbotset_path,
+            )
+
     metrics = rep or {}
-    diagnostics = _collect_backtest_diagnostics(log_path)
 
     artifacts_zip_b64 = None
     callback_batch_enabled = bool(run.config.callback_url) and CALLBACK_BATCH_SIZE > 1
@@ -1875,9 +2017,25 @@ def _execute_pass_job(
         finished_at_utc=now_utc_iso(),
         metrics=metrics,
         artifacts_zip_b64=artifacts_zip_b64,
-        error=None if rep else "report_missing_or_invalid",
+        error=(
+            None
+            if rep
+            else (
+                "2 backtest falliti sullo stesso worker"
+                if attempt_count > 1 and first_failure_diagnostics is not None
+                else "report_missing_or_invalid"
+            )
+        ),
         outcome=None if rep else diagnostics.get("outcome"),
-        error_detail=None if rep else (diagnostics.get("error_detail") or "report_missing_or_invalid"),
+        error_detail=(
+            None
+            if rep
+            else (
+                _format_ga_double_failure_detail(first_failure_diagnostics, diagnostics)
+                if attempt_count > 1 and first_failure_diagnostics is not None
+                else (diagnostics.get("error_detail") or "report_missing_or_invalid")
+            )
+        ),
         log_tail=None if rep else diagnostics.get("log_tail"),
     )
 
